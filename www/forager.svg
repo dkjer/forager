@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="rind" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f5c842"/>
+      <stop offset="100%" stop-color="#d4a017"/>
+    </linearGradient>
+    <linearGradient id="face" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#ffe566"/>
+      <stop offset="50%" stop-color="#ffcc33"/>
+      <stop offset="100%" stop-color="#e6b020"/>
+    </linearGradient>
+    <linearGradient id="side" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#e6b020"/>
+      <stop offset="100%" stop-color="#c89618"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Shadow -->
+  <ellipse cx="34" cy="58" rx="18" ry="4" fill="#1a1a1a" opacity="0.35"/>
+
+  <!-- Cheese wedge — side face (depth) -->
+  <polygon points="8,46 56,46 56,50 8,50" fill="url(#side)" stroke="#b8860b" stroke-width="0.5"/>
+
+  <!-- Cheese wedge — top face (triangle) -->
+  <polygon points="8,46 56,46 32,14" fill="url(#face)" stroke="#d4a017" stroke-width="0.8"/>
+
+  <!-- Rind — bottom edge -->
+  <line x1="8" y1="50" x2="56" y2="50" stroke="url(#rind)" stroke-width="2" stroke-linecap="round"/>
+
+  <!-- Rind — left edge -->
+  <line x1="8" y1="46" x2="8" y2="50" stroke="#d4a017" stroke-width="1.5"/>
+
+  <!-- Rind — right edge -->
+  <line x1="56" y1="46" x2="56" y2="50" stroke="#d4a017" stroke-width="1.5"/>
+
+  <!-- Holes in cheese -->
+  <ellipse cx="28" cy="38" rx="5" ry="4" fill="#e6a800" opacity="0.6"/>
+  <ellipse cx="28" cy="38" rx="4" ry="3" fill="#cc9200" opacity="0.5"/>
+
+  <ellipse cx="42" cy="40" rx="3.5" ry="2.8" fill="#e6a800" opacity="0.6"/>
+  <ellipse cx="42" cy="40" rx="2.8" ry="2.2" fill="#cc9200" opacity="0.5"/>
+
+  <ellipse cx="35" cy="30" rx="3" ry="2.5" fill="#e6a800" opacity="0.6"/>
+  <ellipse cx="35" cy="30" rx="2.3" ry="1.8" fill="#cc9200" opacity="0.5"/>
+
+  <ellipse cx="22" cy="32" rx="2" ry="1.6" fill="#e6a800" opacity="0.5"/>
+
+  <ellipse cx="45" cy="33" rx="2.2" ry="1.8" fill="#e6a800" opacity="0.5"/>
+
+  <!-- Small hole on side face -->
+  <ellipse cx="32" cy="48" rx="2.5" ry="1.2" fill="#b8860b" opacity="0.4"/>
+
+  <!-- Highlight on top -->
+  <polygon points="14,42 44,42 32,20" fill="white" opacity="0.08"/>
+</svg>
