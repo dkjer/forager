@@ -36,20 +36,51 @@ body {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 8px;
-  padding: 20px;
   margin-bottom: 16px;
+  overflow: hidden;
 }
 .card-header {
   display: flex;
-  justify-content: space-between;
   align-items: center;
-  margin-bottom: 16px;
+  padding: 16px 20px;
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 1.5px;
   color: var(--dim);
+  cursor: pointer;
+  user-select: none;
 }
-.card-header .version { color: var(--accent); }
+.card-header:hover { background: rgba(255,255,255,0.02); }
+.card-toggle {
+  display: inline-block;
+  width: 0;
+  height: 0;
+  border-left: 5px solid var(--dim);
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  margin-right: 10px;
+  transition: transform 0.15s;
+  flex-shrink: 0;
+}
+.card-toggle.open {
+  transform: rotate(90deg);
+}
+.card-title { flex: 1; }
+.card-summary {
+  font-size: 11px;
+  color: var(--dim);
+  margin-left: 8px;
+  text-transform: none;
+  letter-spacing: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 200px;
+  text-align: right;
+}
+.card-body {
+  padding: 0 20px 20px;
+}
 
 .row {
   display: flex;
@@ -225,23 +256,7 @@ input[type="number"]:focus { outline: none; border-color: var(--accent); }
 }
 .paused-banner button:hover { background: #3a2a2a; }
 
-.dry-run-card {
-  border-color: var(--yellow);
-}
-.dry-run-card .card-header { color: var(--yellow); }
-.dry-run-card .row .reason { color: var(--dim); font-size: 11px; font-style: italic; }
-.dry-run-card .dismiss {
-  background: none;
-  border: 1px solid var(--border);
-  color: var(--dim);
-  padding: 4px 12px;
-  font-size: 11px;
-  flex: 0;
-  margin-top: 12px;
-}
-.dry-run-card .dismiss:hover { color: var(--text); }
-button.dry { background: #2a2a1a; border-color: var(--yellow); color: var(--yellow); }
-button.dry:hover { background: #3a3a2a; }
+.sim-reason { color: var(--dim); font-size: 11px; font-style: italic; }
 </style>
 </head>
 <body>
@@ -251,11 +266,20 @@ const $ = document.getElementById.bind(document);
 let state = {};
 let countdownInterval = null;
 let pollInterval = null;
+let refreshInterval = null;
 let cookieVisible = false;
 let busy = false;
-let dryResult = null;
 let mbscVisible = false;
 let uaVisible = false;
+
+// Card collapse state — persisted to localStorage
+let collapsed = JSON.parse(localStorage.getItem('forager_collapsed') || '{}');
+function isCollapsed(id) { return !!collapsed[id]; }
+function toggleCollapse(id) {
+  collapsed[id] = !collapsed[id];
+  localStorage.setItem('forager_collapsed', JSON.stringify(collapsed));
+  render();
+}
 
 async function api(path, opts = {}) {
   const res = await fetch(path, opts);
@@ -281,6 +305,10 @@ async function saveSetting(key, value) {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({settings})
   });
+  // Restart auto-refresh timer if interval changed
+  if (key === 'autoRefresh' || key === 'autoRefreshMinutes') {
+    setupAutoRefresh();
+  }
   render();
 }
 
@@ -297,11 +325,9 @@ async function setCookie(val) {
 
 async function setBrowserSession(key, val) {
   if (!val) return;
-  // Strip "mbsc=" prefix if user pasted full cookie string
   if (key === 'mbsc') val = val.replace(/^mbsc=/, '');
   const browserSession = {};
   browserSession[key] = val;
-  // Clear expired flag when setting a new mbsc cookie
   if (key === 'mbsc') {
     browserSession.expired = false;
     browserSession.expiredAt = null;
@@ -341,22 +367,6 @@ async function doSpend() {
   render();
 }
 
-async function doDryRun() {
-  if (busy) return;
-  busy = true;
-  render();
-  try {
-    dryResult = await api('/dry-spend', {method: 'POST'});
-  } catch(e) { console.error(e); }
-  busy = false;
-  render();
-}
-
-function dismissDry() {
-  dryResult = null;
-  render();
-}
-
 async function togglePause() {
   const nowPaused = !!state.paused;
   state = await api('/state', {
@@ -365,49 +375,6 @@ async function togglePause() {
     body: JSON.stringify({paused: !nowPaused})
   });
   render();
-}
-
-function renderDryRun(dr) {
-  if (!dr || !dr.dryRun) return '';
-  return `
-    <div class="card dry-run-card">
-      <div class="card-header">
-        <span>DRY RUN</span>
-        <span>simulation</span>
-      </div>
-      <div class="row"><span class="label">Bonus Points</span><span class="value">${fmt(dr.bonusPoints)}</span></div>
-      <div class="row"><span class="label">Buffer (keep)</span><span class="value">${fmt(dr.buffer)}</span></div>
-      <div class="divider"></div>
-      <div class="row">
-        <span class="label">VIP Top-Off</span>
-        <span class="value">${dr.vip.would ? '<span class="check">YES</span>' : '<span class="dash">no</span>'}</span>
-      </div>
-      <div class="row"><span class="reason">${dr.vip.reason}</span></div>
-      <div class="divider"></div>
-      ${dr.wedge ? `
-      <div class="row">
-        <span class="label">Wedge Purchase</span>
-        <span class="value">${dr.wedge.would ? '<span class="check">YES</span> (−' + fmt(dr.wedge.cost) + ')' : '<span class="dash">no</span>'}</span>
-      </div>
-      <div class="row"><span class="reason">${dr.wedge.reason}</span></div>
-      <div class="divider"></div>
-      ` : ''}
-      <div class="row">
-        <span class="label">Vault Entry</span>
-        <span class="value">${dr.vault.would ? '<span class="check">YES</span> (−' + fmt(dr.vault.cost) + ')' : '<span class="dash">no</span>'}</span>
-      </div>
-      <div class="row"><span class="reason">${dr.vault.reason}</span></div>
-      <div class="divider"></div>
-      <div class="row"><span class="label">Upload Purchase</span><span class="value">${dr.upload.gb > 0 ? fmt(dr.upload.gb) + ' GB (−' + fmt(dr.upload.cost) + ')' : '<span class="dash">none</span>'}</span></div>
-      ${dr.upload.reason ? '<div class="row"><span class="reason">' + dr.upload.reason + '</span></div>' : ''}
-      <div class="divider"></div>
-      <div class="row"><span class="label">Total Cost</span><span class="value" style="color:var(--yellow)">−${fmt(dr.totalCost)}</span></div>
-      <div class="row"><span class="label">Points After</span><span class="value">${fmt(dr.pointsAfter)}</span></div>
-      <div style="display:flex;justify-content:flex-end">
-        <button class="dismiss" onclick="dismissDry()">Dismiss</button>
-      </div>
-    </div>
-  `;
 }
 
 function hasBrowserSession(st) {
@@ -419,60 +386,6 @@ function isBrowserSessionExpired(st) {
   return !!(st.browserSession && st.browserSession.expired);
 }
 
-function renderVault(st) {
-  const v = st.vault || {};
-  const s = st.settings || {};
-  if (!s.vaultMode || s.vaultMode === 'off') return '';
-  if (!hasBrowserSession(st)) {
-    return `
-    <div class="card" style="opacity:0.6">
-      <div class="card-header">
-        <span>MILLIONAIRE'S VAULT</span>
-        <span style="color:var(--dim)">not configured</span>
-      </div>
-      <div class="empty">Set browser session cookie (mbsc) and User-Agent in settings to enable vault access</div>
-    </div>
-    `;
-  }
-  if (isBrowserSessionExpired(st)) {
-    const bs = st.browserSession || {};
-    return `
-    <div class="card" style="border-color:var(--red)">
-      <div class="card-header">
-        <span>MILLIONAIRE'S VAULT</span>
-        <span style="color:var(--red)">session expired</span>
-      </div>
-      <div style="color:var(--red);font-size:12px;text-align:center;padding:8px 0">
-        Browser session has expired${bs.expiredAt ? ' (' + timeAgo(bs.expiredAt) + ')' : ''}.<br>
-        Paste a fresh mbsc cookie from your browser in settings below.
-      </div>
-    </div>
-    `;
-  }
-  const contributed = v.currentPotContributed || 0;
-  const lastEntry = v.lastEntryAt;
-  const potAmt = v.currentPotAmount || 0;
-  const potMax = v.potMax || 20000000;
-  const potPct = potMax > 0 ? Math.min(100, (potAmt / potMax * 100)).toFixed(1) : 0;
-  return `
-    <div class="card">
-      <div class="card-header">
-        <span>MILLIONAIRE'S VAULT</span>
-        <span>${s.vaultMode === 'daily' ? 'daily' : 'once/pot'}</span>
-      </div>
-      ${potAmt > 0 ? `
-      <div class="row"><span class="label">Current Pot</span><span class="value">${fmt(potAmt)} / ${fmt(potMax)}</span></div>
-      <div style="background:var(--border);border-radius:4px;height:6px;margin:6px 0 8px;overflow:hidden">
-        <div style="background:var(--accent);height:100%;width:${potPct}%;border-radius:4px;transition:width 0.3s"></div>
-      </div>
-      ` : ''}
-      ${v.potStartDate ? '<div class="row"><span class="label">Started</span><span class="value">' + v.potStartDate + '</span></div>' : ''}
-      <div class="row"><span class="label">Our Contribution</span><span class="value">${fmt(contributed)} pts</span></div>
-      ${lastEntry ? '<div class="row"><span class="label">Last Contribution</span><span class="value">' + timeAgo(lastEntry) + '</span></div>' : ''}
-    </div>
-  `;
-}
-
 function fmt(n) {
   if (n == null) return '—';
   return Number(n).toLocaleString();
@@ -481,7 +394,6 @@ function fmt(n) {
 function fmtBytes(b) {
   if (b == null || b === '') return '—';
   const s = String(b);
-  // If already formatted (contains TB/GB/MB), return as-is
   if (/[TGMK]B/i.test(s)) return s;
   const n = Number(s);
   if (isNaN(n)) return s;
@@ -539,11 +451,231 @@ function fmtShortDate(ts) {
 function vipDays(ts) {
   if (!ts) return null;
   const d = new Date(ts);
-  const days = Math.floor((d.getTime() - Date.now()) / 86400000);
-  return days;
+  return Math.floor((d.getTime() - Date.now()) / 86400000);
 }
 
-function ck(b) { return b ? '<span style="color:var(--green)">✓</span>' : '<span style="color:var(--dim)">—</span>'; }
+function ck(b) { return b ? '<span style="color:var(--green)">&#10003;</span>' : '<span style="color:var(--dim)">—</span>'; }
+
+function cardHeader(id, title, summary, extraRight) {
+  const open = !isCollapsed(id);
+  return `
+    <div class="card-header" onclick="toggleCollapse('${id}')">
+      <span class="card-toggle ${open ? 'open' : ''}"></span>
+      <span class="card-title">${title}</span>
+      ${!open && summary ? '<span class="card-summary">' + summary + '</span>' : ''}
+      ${open && extraRight ? '<span class="card-summary">' + extraRight + '</span>' : ''}
+    </div>`;
+}
+
+function cardBody(id, content) {
+  if (isCollapsed(id)) return '';
+  return '<div class="card-body">' + content + '</div>';
+}
+
+function renderStats() {
+  const p = state.profile || {};
+  const s = state.settings || {};
+  const hasCookie = !!state.currentCookie;
+  const vd = vipDays(p.vipUntil);
+  const vipDateStr = p.vipUntil ? fmtShortDate(p.vipUntil) : null;
+  const vipStr = vipDateStr ? vipDateStr + (vd != null ? ' (' + vd + 'd)' : '') : '—';
+  const pphVal = state.pointsPerHour || p.pointsPerHour;
+  const pph = pphVal ? Number(pphVal).toLocaleString() : '—';
+
+  let summary = '';
+  if (p.username) {
+    summary = fmt(p.bonusPoints) + ' pts';
+    if (pphVal) summary += ' &middot; ' + pph + '/hr';
+  } else {
+    summary = '<span style="color:var(--red)">no cookie</span>';
+  }
+
+  let body = '';
+  if (p.username) {
+    body = `
+      <div class="row"><span class="label">Bonus Points</span><span class="value">${fmt(p.bonusPoints)}</span></div>
+      <div class="row"><span class="label">Points/Hour</span><span class="value">&asymp; ${pph}</span></div>
+      ${p.satisfiedTorrents != null ? '<div class="row"><span class="label">Seeding</span><span class="value">' + fmt(p.satisfiedTorrents) + ' satisfied</span></div>' : ''}
+      <div class="divider"></div>
+      <div class="row"><span class="label">Uploaded</span><span class="value">${fmtBytes(p.uploaded)}</span></div>
+      <div class="row"><span class="label">Downloaded</span><span class="value">${fmtBytes(p.downloaded)}</span></div>
+      <div class="row"><span class="label">Ratio</span><span class="value">${p.ratio != null ? Number(p.ratio).toFixed(9) : '—'}</span></div>
+      <div class="divider"></div>
+      <div class="row"><span class="label">VIP Expires</span><span class="value">${vipStr}</span></div>
+      <div class="row"><span class="label">Last Refreshed</span><span class="value">${timeAgo(p.fetchedAt)}</span></div>
+    `;
+  } else {
+    body = '<div class="empty">Set your cookie below to get started</div>';
+  }
+  body += `
+    <div class="btn-row">
+      <button onclick="doRefresh()" ${busy ? 'disabled' : ''}>${busy ? 'Working...' : 'Refresh Stats'}</button>
+    </div>
+  `;
+
+  return `
+    <div class="card">
+      ${cardHeader('stats', '<span style="display:flex;align-items:center;gap:8px"><img src="/forager.svg" alt="" style="width:18px;height:18px">FORAGER</span>', summary, 'v' + (state.version || '?'))}
+      ${cardBody('stats', body)}
+    </div>`;
+}
+
+function renderVault() {
+  const v = state.vault || {};
+  const s = state.settings || {};
+  if (!s.vaultMode || s.vaultMode === 'off') return '';
+
+  let summary = '';
+  let borderStyle = '';
+
+  if (!hasBrowserSession(state)) {
+    summary = '<span style="color:var(--dim)">not configured</span>';
+  } else if (isBrowserSessionExpired(state)) {
+    summary = '<span style="color:var(--red)">session expired</span>';
+    borderStyle = 'border-color:var(--red);';
+  } else {
+    const potAmt = v.currentPotAmount || 0;
+    const potMax = v.potMax || 20000000;
+    if (potAmt > 0) {
+      const potPct = (potAmt / potMax * 100).toFixed(0);
+      summary = fmt(potAmt) + ' / ' + fmt(potMax) + ' (' + potPct + '%)';
+    } else {
+      summary = s.vaultMode === 'daily' ? 'daily' : 'once/pot';
+    }
+  }
+
+  let body = '';
+  if (!hasBrowserSession(state)) {
+    body = '<div class="empty">Set browser session cookie (mbsc) and User-Agent in settings to enable vault access</div>';
+  } else if (isBrowserSessionExpired(state)) {
+    const bs = state.browserSession || {};
+    body = `
+      <div style="color:var(--red);font-size:12px;text-align:center;padding:8px 0">
+        Browser session has expired${bs.expiredAt ? ' (' + timeAgo(bs.expiredAt) + ')' : ''}.<br>
+        Paste a fresh mbsc cookie from your browser in settings below.
+      </div>`;
+  } else {
+    const contributed = v.currentPotContributed || 0;
+    const lastEntry = v.lastEntryAt;
+    const potAmt = v.currentPotAmount || 0;
+    const potMax = v.potMax || 20000000;
+    const potPct = potMax > 0 ? Math.min(100, (potAmt / potMax * 100)).toFixed(1) : 0;
+    body = `
+      ${potAmt > 0 ? `
+      <div class="row"><span class="label">Current Pot</span><span class="value">${fmt(potAmt)} / ${fmt(potMax)}</span></div>
+      <div style="background:var(--border);border-radius:4px;height:6px;margin:6px 0 8px;overflow:hidden">
+        <div style="background:var(--accent);height:100%;width:${potPct}%;border-radius:4px;transition:width 0.3s"></div>
+      </div>
+      ` : ''}
+      ${v.potStartDate ? '<div class="row"><span class="label">Started</span><span class="value">' + v.potStartDate + '</span></div>' : ''}
+      <div class="row"><span class="label">Our Contribution</span><span class="value">${fmt(contributed)} pts</span></div>
+      ${lastEntry ? '<div class="row"><span class="label">Last Contribution</span><span class="value">' + timeAgo(lastEntry) + '</span></div>' : ''}
+    `;
+  }
+
+  return `
+    <div class="card" style="${borderStyle}${!hasBrowserSession(state) ? 'opacity:0.6;' : ''}">
+      ${cardHeader('vault', "MILLIONAIRE'S VAULT", summary, s.vaultMode === 'daily' ? 'daily' : 'once/pot')}
+      ${cardBody('vault', body)}
+    </div>`;
+}
+
+function renderNextSpend() {
+  const hasCookie = !!state.currentCookie;
+  const sim = state.simulation;
+  const hasTimer = !!state.nextSpendAt;
+
+  // Summary: countdown timer
+  let summary = '';
+  if (hasTimer) {
+    summary = '<span class="countdown">' + countdown(state.nextSpendAt) + '</span>';
+  } else {
+    summary = '<span style="color:var(--dim)">—</span>';
+  }
+
+  let body = '';
+
+  // Countdown row
+  if (hasTimer) {
+    body += '<div class="row"><span class="label">Next Spend In</span><span class="value countdown" id="cd">' + countdown(state.nextSpendAt) + '</span></div>';
+  }
+
+  // Simulation from cached state
+  if (sim && sim !== null) {
+    if (hasTimer) body += '<div class="divider"></div>';
+    body += `
+      <div class="row"><span class="label">Bonus Points</span><span class="value">${fmt(sim.bonusPoints)}</span></div>
+      <div class="row"><span class="label">Buffer (keep)</span><span class="value">${fmt(sim.buffer)}</span></div>
+      <div class="divider"></div>
+      <div class="row">
+        <span class="label">VIP Top-Off</span>
+        <span class="value">${sim.vip.would ? '<span style="color:var(--green)">YES</span>' : '<span style="color:var(--dim)">no</span>'}</span>
+      </div>
+      <div class="row"><span class="sim-reason">${sim.vip.reason}</span></div>
+      ${sim.wedge ? `
+      <div class="divider"></div>
+      <div class="row">
+        <span class="label">Wedge Purchase</span>
+        <span class="value">${sim.wedge.would ? '<span style="color:var(--green)">YES</span> (&minus;' + fmt(sim.wedge.cost) + ')' : '<span style="color:var(--dim)">no</span>'}</span>
+      </div>
+      <div class="row"><span class="sim-reason">${sim.wedge.reason}</span></div>
+      ` : ''}
+      <div class="divider"></div>
+      <div class="row">
+        <span class="label">Vault Entry</span>
+        <span class="value">${sim.vault.would ? '<span style="color:var(--green)">YES</span> (&minus;' + fmt(sim.vault.cost) + ')' : '<span style="color:var(--dim)">no</span>'}</span>
+      </div>
+      <div class="row"><span class="sim-reason">${sim.vault.reason}</span></div>
+      <div class="divider"></div>
+      <div class="row"><span class="label">Upload Purchase</span><span class="value">${sim.upload.gb > 0 ? fmt(sim.upload.gb) + ' GB (&minus;' + fmt(sim.upload.cost) + ')' : '<span style="color:var(--dim)">none</span>'}</span></div>
+      ${sim.upload.reason ? '<div class="row"><span class="sim-reason">' + sim.upload.reason + '</span></div>' : ''}
+      <div class="divider"></div>
+      <div class="row"><span class="label">Total Cost</span><span class="value" style="color:var(--yellow)">&minus;${fmt(sim.totalCost)}</span></div>
+      <div class="row"><span class="label">Points After</span><span class="value">${fmt(sim.pointsAfter)}</span></div>
+    `;
+  } else {
+    if (hasTimer) body += '<div class="divider"></div>';
+    body += '<div class="empty" style="padding:8px 0">Refresh stats to see spend preview</div>';
+  }
+
+  body += `
+    <div class="btn-row">
+      <button class="primary" onclick="doSpend()" ${busy || !hasCookie ? 'disabled' : ''}>${busy ? 'Working...' : 'Spend Now'}</button>
+    </div>
+  `;
+
+  return `
+    <div class="card">
+      ${cardHeader('next', 'NEXT SPEND', summary)}
+      ${cardBody('next', body)}
+    </div>`;
+}
+
+function renderLastSpend() {
+  const ls = state.lastSpend || {};
+  const lt = state.lifetime || {};
+  if (!ls.at) return '';
+
+  const summary = fmtDate(ls.at) + ' &middot; &minus;' + fmt(ls.pointsSpent) + ' pts';
+
+  const body = `
+    <div class="row"><span class="label">VIP Topped Off</span><span class="value">${ck(ls.vipPurchased)}</span></div>
+    <div class="row"><span class="label">Wedge Purchased</span><span class="value">${ck(ls.wedgePurchased)}</span></div>
+    <div class="row"><span class="label">Vault Entered</span><span class="value">${ck(ls.vaultEntered)}</span></div>
+    <div class="row"><span class="label">Upload Purchased</span><span class="value">${fmt(ls.uploadGbPurchased)} GB</span></div>
+    <div class="row"><span class="label">Points Spent</span><span class="value">${fmt(ls.pointsSpent)}</span></div>
+    <div class="divider"></div>
+    <div class="row"><span class="label" style="text-transform:uppercase;letter-spacing:1px;font-size:11px">Lifetime</span><span></span></div>
+    <div class="row"><span class="label">Total Purchased</span><span class="value">${fmt(lt.totalGbPurchased)} GB</span></div>
+    <div class="row"><span class="label">Total Spent</span><span class="value">${fmt(lt.totalPointsSpent)} pts</span></div>
+  `;
+
+  return `
+    <div class="card">
+      ${cardHeader('last', 'LAST SPEND', summary, fmtDate(ls.at))}
+      ${cardBody('last', body)}
+    </div>`;
+}
 
 function renderHistory(history) {
   if (!history || !history.length) return '<div class="empty">No spend history yet</div>';
@@ -561,24 +693,155 @@ function renderHistory(history) {
         <span class="trigger-badge ${e.trigger}">${e.trigger}</span>
       </div>
       <div class="history-details">
-        ${summary}  <span class="dim">(−${fmt(e.pointsSpent)} pts)</span>
+        ${summary}  <span style="color:var(--dim)">(&minus;${fmt(e.pointsSpent)} pts)</span>
       </div>
     </div>`;
   }).join('');
 }
 
-function render() {
-  const p = state.profile || {};
-  const s = state.settings || {};
-  const ls = state.lastSpend || {};
-  const lt = state.lifetime || {};
-  const hasCookie = !!state.currentCookie;
-  const vd = vipDays(p.vipUntil);
-  const vipDateStr = p.vipUntil ? fmtShortDate(p.vipUntil) : null;
-  const vipStr = vipDateStr ? vipDateStr + (vd != null ? ' (' + vd + 'd)' : '') : '—';
-  const pphVal = state.pointsPerHour || p.pointsPerHour;
-  const pph = pphVal ? '≈ ' + Number(pphVal).toLocaleString() : '—';
+function renderHistoryCard() {
+  const history = state.spendHistory || [];
+  const summary = history.length ? history.length + ' entries' : 'empty';
 
+  return `
+    <div class="card">
+      ${cardHeader('history', 'SPEND HISTORY', summary)}
+      ${cardBody('history', '<div class="history-list">' + renderHistory(history) + '</div>')}
+    </div>`;
+}
+
+function renderSettings() {
+  const s = state.settings || {};
+  const hasCookie = !!state.currentCookie;
+  const isPaused = !!state.paused;
+
+  let statusParts = [];
+  if (!hasCookie) {
+    statusParts.push('<span style="color:var(--red)">no cookie</span>');
+  }
+  if (isBrowserSessionExpired(state)) {
+    statusParts.push('<span style="color:var(--red)">mbsc expired</span>');
+  } else if (!hasBrowserSession(state) && s.vaultMode && s.vaultMode !== 'off') {
+    statusParts.push('<span style="color:var(--yellow)">no mbsc</span>');
+  }
+  if (isPaused) {
+    statusParts.push('<span style="color:var(--red)">paused</span>');
+  }
+  const summary = statusParts.length ? statusParts.join(' &middot; ') : '<span style="color:var(--green)">ok</span>';
+
+  const body = `
+    <div class="setting-row">
+      <label>Points Buffer</label>
+      <input type="number" value="${s.pointsBuffer || 10000}" min="0" step="1000"
+        onchange="saveSetting('pointsBuffer', parseInt(this.value))">
+    </div>
+    <div class="setting-row">
+      <label>Spend Interval (hrs)</label>
+      <input type="number" value="${s.spendIntervalHours || 24}" min="1" max="168" step="1"
+        onchange="saveSetting('spendIntervalHours', parseInt(this.value))">
+    </div>
+    <div class="setting-row">
+      <label>Min Upload Buy</label>
+      <select onchange="saveSetting('minSpendGb', parseFloat(this.value))"
+        style="background:var(--bg);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:12px;padding:4px 8px;border-radius:4px">
+        <option value="0" ${s.minSpendGb==0?'selected':''}>Off</option>
+        <option value="50" ${(s.minSpendGb||50)==50?'selected':''}>50 GB (25,000 pts)</option>
+        <option value="100" ${s.minSpendGb==100?'selected':''}>100 GB (50,000 pts)</option>
+      </select>
+    </div>
+    <div class="setting-row">
+      <label>Freeleech Wedge</label>
+      <select onchange="saveSetting('wedgeMode', this.value)"
+        style="background:var(--bg);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:12px;padding:4px 8px;border-radius:4px">
+        <option value="off" ${(s.wedgeMode||'off')==='off'?'selected':''}>Off</option>
+        <option value="before" ${s.wedgeMode==='before'?'selected':''}>Before Upload</option>
+        <option value="only" ${s.wedgeMode==='only'?'selected':''}>FL Only</option>
+      </select>
+    </div>
+    <div class="setting-row">
+      <label>Auto VIP</label>
+      <label class="toggle">
+        <input type="checkbox" ${s.autoVip ? 'checked' : ''}
+          onchange="saveSetting('autoVip', this.checked)">
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="setting-row">
+      <label>Millionaire's Vault</label>
+      <select onchange="saveSetting('vaultMode', this.value)"
+        ${hasBrowserSession(state) ? '' : 'disabled'}
+        style="background:var(--bg);border:1px solid var(--border);color:${hasBrowserSession(state) ? 'var(--text)' : 'var(--dim)'};font-family:var(--mono);font-size:12px;padding:4px 8px;border-radius:4px;${hasBrowserSession(state) ? '' : 'opacity:0.5;cursor:not-allowed'}">
+        <option value="off" ${(s.vaultMode||'off')==='off'?'selected':''}>Off</option>
+        <option value="once" ${s.vaultMode==='once'?'selected':''}>Once per pot</option>
+        <option value="daily" ${s.vaultMode==='daily'?'selected':''}>Daily</option>
+      </select>
+    </div>
+    ${!hasBrowserSession(state) ? '<div style="color:var(--dim);font-size:11px;font-style:italic;padding:0 0 8px">Set browser session below to enable vault</div>' : ''}
+    <div class="divider"></div>
+    <div class="setting-row">
+      <label>Auto-Refresh</label>
+      <label class="toggle">
+        <input type="checkbox" ${s.autoRefresh !== false ? 'checked' : ''}
+          onchange="saveSetting('autoRefresh', this.checked)">
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="setting-row">
+      <label>Refresh Interval (min)</label>
+      <input type="number" value="${s.autoRefreshMinutes || 5}" min="1" max="60" step="1"
+        onchange="saveSetting('autoRefreshMinutes', parseInt(this.value))"
+        style="width:60px">
+    </div>
+    <div class="divider"></div>
+    <div class="cookie-row">
+      <span class="cookie-dot ${hasCookie ? 'set' : 'unset'}"></span>
+      <span style="color:var(--dim);font-size:12px">Cookie ${hasCookie ? '&bull; Set' : '&bull; Not Set'}</span>
+      <button style="flex:0;padding:6px 12px;font-size:11px" onclick="toggleCookie()">
+        ${cookieVisible ? 'Cancel' : 'Set Cookie'}
+      </button>
+    </div>
+    <input type="text" class="cookie-input ${cookieVisible ? 'visible' : ''}" id="cookieInput"
+      placeholder="Paste mam_id cookie value..."
+      onkeydown="if(event.key==='Enter')setCookie(this.value)">
+    <div class="divider"></div>
+    <div style="color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:1px;padding:8px 0 4px">Browser Session (for Vault)</div>
+    ${isBrowserSessionExpired(state) ? '<div style="color:var(--red);font-size:11px;padding:0 0 8px">Session expired — paste a fresh mbsc cookie from your browser</div>' : ''}
+    <div class="cookie-row">
+      <span class="cookie-dot ${(state.browserSession||{}).mbsc ? (isBrowserSessionExpired(state) ? 'unset' : 'set') : 'unset'}"></span>
+      <span style="color:var(--dim);font-size:12px">mbsc ${(state.browserSession||{}).mbsc ? (isBrowserSessionExpired(state) ? '&bull; Expired' : '&bull; Set') : '&bull; Not Set'}</span>
+      <button style="flex:0;padding:6px 12px;font-size:11px" onclick="mbscVisible=!mbscVisible;render();if(mbscVisible){var i=document.getElementById('mbscInput');if(i)i.focus()}">
+        ${mbscVisible ? 'Cancel' : 'Set'}
+      </button>
+    </div>
+    <input type="text" class="cookie-input ${mbscVisible ? 'visible' : ''}" id="mbscInput"
+      placeholder="Paste mbsc cookie value from browser..."
+      onkeydown="if(event.key==='Enter')setBrowserSession('mbsc',this.value)">
+    <div class="cookie-row">
+      <span class="cookie-dot ${(state.browserSession||{}).userAgent ? 'set' : 'unset'}"></span>
+      <span style="color:var(--dim);font-size:12px">User-Agent ${(state.browserSession||{}).userAgent ? '&bull; Set' : '&bull; Not Set'}</span>
+      <button style="flex:0;padding:6px 12px;font-size:11px" onclick="uaVisible=!uaVisible;render();if(uaVisible){var i=document.getElementById('uaInput');if(i)i.focus()}">
+        ${uaVisible ? 'Cancel' : 'Set'}
+      </button>
+    </div>
+    <input type="text" class="cookie-input ${uaVisible ? 'visible' : ''}" id="uaInput"
+      placeholder="Paste your browser User-Agent string..."
+      onkeydown="if(event.key==='Enter')setBrowserSession('userAgent',this.value)">
+    <div class="divider"></div>
+    <div class="setting-row">
+      <label>${isPaused ? 'Spending is paused' : 'Spending is active'}</label>
+      <button style="flex:0;padding:6px 16px;font-size:11px;${isPaused ? 'border-color:var(--green);color:var(--green)' : 'border-color:var(--red);color:var(--red)'}"
+        onclick="togglePause()">${isPaused ? 'Resume' : 'Pause'}</button>
+    </div>
+  `;
+
+  return `
+    <div class="card">
+      ${cardHeader('settings', 'SETTINGS', summary)}
+      ${cardBody('settings', body)}
+    </div>`;
+}
+
+function render() {
   const isPaused = !!state.paused;
 
   $('app').innerHTML = `
@@ -592,157 +855,16 @@ function render() {
     </div>
     ` : ''}
 
-    <div class="card">
-      <div class="card-header">
-        <span style="display:flex;align-items:center;gap:8px"><img src="/forager.svg" alt="" style="width:22px;height:22px">FORAGER</span>
-        <span class="version">v${state.version || '?'}</span>
-      </div>
-      ${p.username ? `
-      <div class="row"><span class="label">Bonus Points</span><span class="value">${fmt(p.bonusPoints)}</span></div>
-      <div class="row"><span class="label">Points/Hour</span><span class="value">${pph}</span></div>
-      ${p.satisfiedTorrents != null ? `<div class="row"><span class="label">Seeding</span><span class="value">${fmt(p.satisfiedTorrents)} satisfied</span></div>` : ''}
-      <div class="divider"></div>
-      <div class="row"><span class="label">Uploaded</span><span class="value">${fmtBytes(p.uploaded)}</span></div>
-      <div class="row"><span class="label">Downloaded</span><span class="value">${fmtBytes(p.downloaded)}</span></div>
-      <div class="row"><span class="label">Ratio</span><span class="value">${p.ratio != null ? Number(p.ratio).toFixed(9) : '—'}</span></div>
-      <div class="divider"></div>
-      <div class="row"><span class="label">VIP Expires</span><span class="value">${vipStr}</span></div>
-      <div class="row"><span class="label">Last Refreshed</span><span class="value">${timeAgo(p.fetchedAt)}</span></div>
-      ` : '<div class="empty">Set your cookie below to get started</div>'}
-      <div class="btn-row">
-        <button onclick="doRefresh()" ${busy ? 'disabled' : ''}>${busy ? 'Working...' : 'Refresh Stats'}</button>
-        <button class="dry" onclick="doDryRun()" ${busy || !hasCookie ? 'disabled' : ''}>${busy ? 'Working...' : 'Dry Run'}</button>
-        <button class="primary" onclick="doSpend()" ${busy || !hasCookie ? 'disabled' : ''}>${busy ? 'Working...' : 'Spend Now'}</button>
-      </div>
+    ${renderStats()}
+    ${renderVault()}
+    ${renderNextSpend()}
+    ${renderLastSpend()}
+    ${renderHistoryCard()}
+    ${renderSettings()}
+
+    <div class="status-msg">
+      Polling every 30s${(state.settings || {}).autoRefresh !== false ? ' &middot; auto-refresh every ' + ((state.settings || {}).autoRefreshMinutes || 5) + 'min' : ''}
     </div>
-
-    ${renderDryRun(dryResult)}
-
-    ${renderVault(state)}
-
-    ${ls.at ? `
-    <div class="card">
-      <div class="card-header">
-        <span>LAST SPEND</span>
-        <span>${fmtDate(ls.at)}</span>
-      </div>
-      <div class="row"><span class="label">VIP Topped Off</span><span class="value">${ck(ls.vipPurchased)}</span></div>
-      <div class="row"><span class="label">Wedge Purchased</span><span class="value">${ck(ls.wedgePurchased)}</span></div>
-      <div class="row"><span class="label">Vault Entered</span><span class="value">${ck(ls.vaultEntered)}</span></div>
-      <div class="row"><span class="label">Upload Purchased</span><span class="value">${fmt(ls.uploadGbPurchased)} GB</span></div>
-      <div class="row"><span class="label">Points Spent</span><span class="value">${fmt(ls.pointsSpent)}</span></div>
-      <div class="divider"></div>
-      <div class="row"><span class="label">Next Spend In</span><span class="value countdown" id="cd">${countdown(state.nextSpendAt)}</span></div>
-      <div class="divider"></div>
-      <div class="row"><span class="label" style="text-transform:uppercase;letter-spacing:1px;font-size:11px">Lifetime</span><span></span></div>
-      <div class="row"><span class="label">Total Purchased</span><span class="value">${fmt(lt.totalGbPurchased)} GB</span></div>
-      <div class="row"><span class="label">Total Spent</span><span class="value">${fmt(lt.totalPointsSpent)} pts</span></div>
-    </div>
-    ` : (state.nextSpendAt ? `
-    <div class="card">
-      <div class="card-header"><span>NEXT SPEND</span></div>
-      <div class="row"><span class="label">Next Spend In</span><span class="value countdown" id="cd">${countdown(state.nextSpendAt)}</span></div>
-    </div>
-    ` : '')}
-
-    <div class="card">
-      <div class="card-header"><span>SPEND HISTORY</span></div>
-      <div class="history-list">
-        ${renderHistory(state.spendHistory)}
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="card-header"><span>SETTINGS</span></div>
-      <div class="setting-row">
-        <label>Points Buffer</label>
-        <input type="number" value="${s.pointsBuffer || 10000}" min="0" step="1000"
-          onchange="saveSetting('pointsBuffer', parseInt(this.value))">
-      </div>
-      <div class="setting-row">
-        <label>Spend Interval (hrs)</label>
-        <input type="number" value="${s.spendIntervalHours || 24}" min="1" max="168" step="1"
-          onchange="saveSetting('spendIntervalHours', parseInt(this.value))">
-      </div>
-      <div class="setting-row">
-        <label>Min Upload Buy</label>
-        <select onchange="saveSetting('minSpendGb', parseFloat(this.value))"
-          style="background:var(--bg);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:12px;padding:4px 8px;border-radius:4px">
-          <option value="0" ${s.minSpendGb==0?'selected':''}>Off</option>
-          <option value="50" ${(s.minSpendGb||50)==50?'selected':''}>50 GB (25,000 pts)</option>
-          <option value="100" ${s.minSpendGb==100?'selected':''}>100 GB (50,000 pts)</option>
-        </select>
-      </div>
-      <div class="setting-row">
-        <label>Freeleech Wedge</label>
-        <select onchange="saveSetting('wedgeMode', this.value)"
-          style="background:var(--bg);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:12px;padding:4px 8px;border-radius:4px">
-          <option value="off" ${(s.wedgeMode||'off')==='off'?'selected':''}>Off</option>
-          <option value="before" ${s.wedgeMode==='before'?'selected':''}>Before Upload</option>
-          <option value="only" ${s.wedgeMode==='only'?'selected':''}>FL Only</option>
-        </select>
-      </div>
-      <div class="setting-row">
-        <label>Auto VIP</label>
-        <label class="toggle">
-          <input type="checkbox" ${s.autoVip ? 'checked' : ''}
-            onchange="saveSetting('autoVip', this.checked)">
-          <span class="slider"></span>
-        </label>
-      </div>
-      <div class="setting-row">
-        <label>Millionaire's Vault</label>
-        <select onchange="saveSetting('vaultMode', this.value)"
-          ${hasBrowserSession(state) ? '' : 'disabled'}
-          style="background:var(--bg);border:1px solid var(--border);color:${hasBrowserSession(state) ? 'var(--text)' : 'var(--dim)'};font-family:var(--mono);font-size:12px;padding:4px 8px;border-radius:4px;${hasBrowserSession(state) ? '' : 'opacity:0.5;cursor:not-allowed'}">
-          <option value="off" ${(s.vaultMode||'off')==='off'?'selected':''}>Off</option>
-          <option value="once" ${s.vaultMode==='once'?'selected':''}>Once per pot</option>
-          <option value="daily" ${s.vaultMode==='daily'?'selected':''}>Daily</option>
-        </select>
-      </div>
-      ${!hasBrowserSession(state) ? '<div style="color:var(--dim);font-size:11px;font-style:italic;padding:0 0 8px">Set browser session below to enable vault</div>' : ''}
-      <div class="cookie-row">
-        <span class="cookie-dot ${hasCookie ? 'set' : 'unset'}"></span>
-        <span style="color:var(--dim);font-size:12px">Cookie ${hasCookie ? '● Set' : '● Not Set'}</span>
-        <button style="flex:0;padding:6px 12px;font-size:11px" onclick="toggleCookie()">
-          ${cookieVisible ? 'Cancel' : 'Set Cookie'}
-        </button>
-      </div>
-      <input type="text" class="cookie-input ${cookieVisible ? 'visible' : ''}" id="cookieInput"
-        placeholder="Paste mam_id cookie value..."
-        onkeydown="if(event.key==='Enter')setCookie(this.value)">
-      <div class="divider"></div>
-      <div style="color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:1px;padding:8px 0 4px">Browser Session (for Vault)</div>
-      ${isBrowserSessionExpired(state) ? '<div style="color:var(--red);font-size:11px;padding:0 0 8px">Session expired — paste a fresh mbsc cookie from your browser</div>' : ''}
-      <div class="cookie-row">
-        <span class="cookie-dot ${(state.browserSession||{}).mbsc ? (isBrowserSessionExpired(state) ? 'unset' : 'set') : 'unset'}"></span>
-        <span style="color:var(--dim);font-size:12px">mbsc ${(state.browserSession||{}).mbsc ? (isBrowserSessionExpired(state) ? '● Expired' : '● Set') : '● Not Set'}</span>
-        <button style="flex:0;padding:6px 12px;font-size:11px" onclick="mbscVisible=!mbscVisible;render();if(mbscVisible){var i=document.getElementById('mbscInput');if(i)i.focus()}">
-          ${mbscVisible ? 'Cancel' : 'Set'}
-        </button>
-      </div>
-      <input type="text" class="cookie-input ${mbscVisible ? 'visible' : ''}" id="mbscInput"
-        placeholder="Paste mbsc cookie value from browser..."
-        onkeydown="if(event.key==='Enter')setBrowserSession('mbsc',this.value)">
-      <div class="cookie-row">
-        <span class="cookie-dot ${(state.browserSession||{}).userAgent ? 'set' : 'unset'}"></span>
-        <span style="color:var(--dim);font-size:12px">User-Agent ${(state.browserSession||{}).userAgent ? '● Set' : '● Not Set'}</span>
-        <button style="flex:0;padding:6px 12px;font-size:11px" onclick="uaVisible=!uaVisible;render();if(uaVisible){var i=document.getElementById('uaInput');if(i)i.focus()}">
-          ${uaVisible ? 'Cancel' : 'Set'}
-        </button>
-      </div>
-      <input type="text" class="cookie-input ${uaVisible ? 'visible' : ''}" id="uaInput"
-        placeholder="Paste your browser User-Agent string..."
-        onkeydown="if(event.key==='Enter')setBrowserSession('userAgent',this.value)">
-      <div class="divider"></div>
-      <div class="setting-row">
-        <label>${isPaused ? 'Spending is paused' : 'Spending is active'}</label>
-        <button style="flex:0;padding:6px 16px;font-size:11px;${isPaused ? 'border-color:var(--green);color:var(--green)' : 'border-color:var(--red);color:var(--red)'}"
-          onclick="togglePause()">${isPaused ? 'Resume' : 'Pause'}</button>
-      </div>
-    </div>
-
-    <div class="status-msg">Polling every 30s</div>
   `;
 }
 
@@ -765,7 +887,15 @@ function startCountdown() {
   }, 1000);
 }
 
-// Read version from health endpoint
+function setupAutoRefresh() {
+  if (refreshInterval) clearInterval(refreshInterval);
+  const s = state.settings || {};
+  if (s.autoRefresh !== false) {
+    const mins = s.autoRefreshMinutes || 5;
+    refreshInterval = setInterval(doRefresh, mins * 60 * 1000);
+  }
+}
+
 async function loadVersion() {
   try {
     const h = await api('/health');
@@ -778,6 +908,7 @@ async function init() {
   await loadState();
   startCountdown();
   pollInterval = setInterval(loadState, 30000);
+  setupAutoRefresh();
 }
 
 init();

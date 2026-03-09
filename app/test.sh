@@ -61,6 +61,8 @@ test_init_state_defaults() {
   assertEquals "24" "$(echo "$state" | jq -r '.settings.spendIntervalHours')"
   assertEquals "off" "$(echo "$state" | jq -r '.settings.wedgeMode')"
   assertEquals "50" "$(echo "$state" | jq -r '.settings.minSpendGb')"
+  assertEquals "true" "$(echo "$state" | jq -r '.settings.autoRefresh')"
+  assertEquals "5" "$(echo "$state" | jq -r '.settings.autoRefreshMinutes')"
   assertEquals "false" "$(echo "$state" | jq -r '.paused')"
   assertEquals "null" "$(echo "$state" | jq -r '.browserSession.mbsc')"
   assertEquals "null" "$(echo "$state" | jq -r '.browserSession.userAgent')"
@@ -135,6 +137,213 @@ test_get_cookie_set() {
   local cookie
   cookie=$(get_cookie)
   assertEquals "test_cookie_123" "$cookie"
+}
+
+# --- Simulation Tests ---
+
+# Helper: create state with profile and settings for simulation testing
+make_sim_state() {
+  local points="$1" vip_days_left="$2" buffer="$3"
+  local auto_vip="${4:-true}" wedge_mode="${5:-off}" vault_mode="${6:-off}"
+  local min_spend_gb="${7:-50}"
+  local vip_until
+  local future_epoch=$(($(date +%s) + vip_days_left * 86400))
+  vip_until=$(date -d "@${future_epoch}" '+%Y-%m-%d 00:00:00' 2>/dev/null)
+
+  reset_state
+  acquire_lock
+  local state
+  state=$(read_state)
+  state=$(echo "$state" | jq \
+    --argjson pts "$points" \
+    --arg vip "$vip_until" \
+    --argjson buf "$buffer" \
+    --argjson av "$auto_vip" \
+    --arg wm "$wedge_mode" \
+    --arg vm "$vault_mode" \
+    --argjson msg "$min_spend_gb" \
+    '
+    .profile.bonusPoints = $pts |
+    .profile.vipUntil = $vip |
+    .profile.username = "testuser" |
+    .settings.pointsBuffer = $buf |
+    .settings.autoVip = $av |
+    .settings.wedgeMode = $wm |
+    .settings.vaultMode = $vm |
+    .settings.minSpendGb = $msg
+    ')
+  echo "$state" | write_state
+  release_lock
+}
+
+test_sim_no_profile() {
+  reset_state
+  local state sim
+  state=$(read_state)
+  sim=$(calc_simulation "$state")
+  assertEquals "null" "$sim"
+}
+
+test_sim_upload_only() {
+  # 100k points, 10k buffer, VIP at cap (90d), no wedge, no vault
+  make_sim_state 100000 90 10000 false off off 50
+  local state sim
+  state=$(read_state)
+  sim=$(calc_simulation "$state")
+  assertEquals "false" "$(echo "$sim" | jq -r '.vip.would')"
+  assertEquals "false" "$(echo "$sim" | jq -r '.wedge.would')"
+  assertEquals "false" "$(echo "$sim" | jq -r '.vault.would')"
+  # spendable = 100000 - 10000 = 90000 / 500 = 180 GB
+  assertEquals "180" "$(echo "$sim" | jq -r '.upload.gb')"
+  assertEquals "90000" "$(echo "$sim" | jq -r '.upload.cost')"
+  assertEquals "10000" "$(echo "$sim" | jq -r '.pointsAfter')"
+}
+
+test_sim_buffer_prevents_upload() {
+  # 30k points, 25k buffer → only 5k spendable = 10 GB, below 50 GB min
+  make_sim_state 30000 90 25000 false off off 50
+  local state sim
+  state=$(read_state)
+  sim=$(calc_simulation "$state")
+  assertEquals "0" "$(echo "$sim" | jq -r '.upload.gb')"
+  assertEquals "0" "$(echo "$sim" | jq -r '.totalCost')"
+  assertEquals "30000" "$(echo "$sim" | jq -r '.pointsAfter')"
+}
+
+test_sim_vip_respects_buffer() {
+  # 12k points, 10k buffer, VIP needs top-off (50 days left → 40 days to buy ≈ 7143 pts)
+  # 12000 - 7143 = 4857 < 10000 buffer → should NOT buy VIP
+  make_sim_state 12000 50 10000 true off off 50
+  local state sim
+  state=$(read_state)
+  sim=$(calc_simulation "$state")
+  assertEquals "false" "$(echo "$sim" | jq -r '.vip.would')"
+  echo "$sim" | jq -r '.vip.reason' | grep -q "breach buffer" \
+    || fail "VIP reason should mention buffer breach: $(echo "$sim" | jq -r '.vip.reason')"
+}
+
+test_sim_vip_affordable() {
+  # 50k points, 10k buffer, VIP needs top-off (80 days left → 10 days ≈ 1786 pts)
+  # 50000 - 1786 = 48214 > 10000 buffer → should buy VIP
+  make_sim_state 50000 80 10000 true off off 50
+  local state sim
+  state=$(read_state)
+  sim=$(calc_simulation "$state")
+  assertEquals "true" "$(echo "$sim" | jq -r '.vip.would')"
+}
+
+test_sim_wedge_respects_buffer() {
+  # 55k points, 10k buffer, wedge costs 50k
+  # 55000 - 50000 = 5000 < 10000 buffer → should NOT buy wedge
+  make_sim_state 55000 90 10000 false before off 50
+  local state sim
+  state=$(read_state)
+  sim=$(calc_simulation "$state")
+  assertEquals "false" "$(echo "$sim" | jq -r '.wedge.would')"
+  echo "$sim" | jq -r '.wedge.reason' | grep -q "breach buffer" \
+    || fail "Wedge reason should mention buffer breach: $(echo "$sim" | jq -r '.wedge.reason')"
+}
+
+test_sim_wedge_affordable() {
+  # 70k points, 10k buffer, wedge costs 50k
+  # 70000 - 50000 = 20000 > 10000 buffer → should buy wedge
+  make_sim_state 70000 90 10000 false before off 50
+  local state sim
+  state=$(read_state)
+  sim=$(calc_simulation "$state")
+  assertEquals "true" "$(echo "$sim" | jq -r '.wedge.would')"
+  assertEquals "50000" "$(echo "$sim" | jq -r '.wedge.cost')"
+}
+
+test_sim_vault_respects_buffer() {
+  # 11k points, 10k buffer, vault costs 2k
+  # 11000 - 2000 = 9000 < 10000 buffer → should NOT enter vault
+  make_sim_state 11000 90 10000 false off once 50
+  acquire_lock
+  local state
+  state=$(read_state)
+  echo "$state" | jq '.browserSession.mbsc = "test" | .browserSession.userAgent = "test"' | write_state
+  release_lock
+  state=$(read_state)
+  local sim
+  sim=$(calc_simulation "$state")
+  assertEquals "false" "$(echo "$sim" | jq -r '.vault.would')"
+  echo "$sim" | jq -r '.vault.reason' | grep -q "above buffer" \
+    || fail "Vault reason should mention buffer: $(echo "$sim" | jq -r '.vault.reason')"
+}
+
+test_sim_vault_affordable() {
+  # 15k points, 10k buffer, vault costs 2k
+  # 15000 - 2000 = 13000 > 10000 buffer → should enter vault
+  make_sim_state 15000 90 10000 false off once 50
+  acquire_lock
+  local state
+  state=$(read_state)
+  echo "$state" | jq '.browserSession.mbsc = "test" | .browserSession.userAgent = "test"' | write_state
+  release_lock
+  state=$(read_state)
+  local sim
+  sim=$(calc_simulation "$state")
+  assertEquals "true" "$(echo "$sim" | jq -r '.vault.would')"
+  assertEquals "2000" "$(echo "$sim" | jq -r '.vault.cost')"
+}
+
+test_sim_all_purchases() {
+  # 200k points, 10k buffer, VIP 80d, wedge before, vault once
+  # VIP: ~1786 pts, wedge: 50000, vault: 2000
+  # remaining after VIP+wedge+vault ≈ 146214, spendable = 146214 - 10000 = 136214
+  # upload = 136214/500 = 272 GB
+  make_sim_state 200000 80 10000 true before once 50
+  acquire_lock
+  local state
+  state=$(read_state)
+  echo "$state" | jq '.browserSession.mbsc = "test" | .browserSession.userAgent = "test"' | write_state
+  release_lock
+  state=$(read_state)
+  local sim
+  sim=$(calc_simulation "$state")
+  assertEquals "true" "$(echo "$sim" | jq -r '.vip.would')"
+  assertEquals "true" "$(echo "$sim" | jq -r '.wedge.would')"
+  assertEquals "true" "$(echo "$sim" | jq -r '.vault.would')"
+  # Upload GB should be > 0
+  local gb
+  gb=$(echo "$sim" | jq -r '.upload.gb')
+  assertTrue "Upload should be > 0, got $gb" "[ $gb -gt 0 ]"
+  # Points after should be close to buffer
+  local after
+  after=$(echo "$sim" | jq -r '.pointsAfter')
+  assertTrue "Points after ($after) should be near buffer (10000)" "[ $after -ge 10000 ] && [ $after -lt 11000 ]"
+}
+
+test_sim_min_spend_gb_threshold() {
+  # 35k points, 10k buffer → 25k spendable = 50 GB, exactly at min
+  make_sim_state 35000 90 10000 false off off 50
+  local state sim
+  state=$(read_state)
+  sim=$(calc_simulation "$state")
+  assertEquals "50" "$(echo "$sim" | jq -r '.upload.gb')"
+  assertEquals "25000" "$(echo "$sim" | jq -r '.upload.cost')"
+}
+
+test_sim_min_spend_gb_below_threshold() {
+  # 34k points, 10k buffer → 24k spendable = 48 GB, below 50 GB min
+  make_sim_state 34000 90 10000 false off off 50
+  local state sim
+  state=$(read_state)
+  sim=$(calc_simulation "$state")
+  assertEquals "0" "$(echo "$sim" | jq -r '.upload.gb')"
+}
+
+test_sim_wedge_only_mode() {
+  # wedge=only should skip upload entirely
+  make_sim_state 200000 90 10000 false only off 50
+  local state sim
+  state=$(read_state)
+  sim=$(calc_simulation "$state")
+  assertEquals "true" "$(echo "$sim" | jq -r '.wedge.would')"
+  assertEquals "0" "$(echo "$sim" | jq -r '.upload.gb')"
+  echo "$sim" | jq -r '.upload.reason' | grep -q "Wedge-only" \
+    || fail "Upload reason should mention wedge-only: $(echo "$sim" | jq -r '.upload.reason')"
 }
 
 # --- Integration Tests (HTTP) ---

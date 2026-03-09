@@ -43,13 +43,15 @@ if [ "$REQUEST_METHOD" = "PUT" ]; then
   state=$(read_state)
   release_lock
 
-  # Return full state with computed fields
+  # Return full state with computed fields + simulation
   points_per_hour=$(calc_points_per_hour "$state")
+  simulation=$(calc_simulation "$state")
 
   result=$(echo "$state" | jq \
     --argjson pph "$points_per_hour" \
+    --argjson sim "$simulation" \
     --arg ver "$version" \
-    '. + {pointsPerHour: $pph, version: $ver}')
+    '. + {pointsPerHour: $pph, simulation: $sim, version: $ver}')
   respond "200" "$result"
 else
   # GET
@@ -58,10 +60,12 @@ else
   release_lock
 
   points_per_hour=$(calc_points_per_hour "$state")
+  simulation=$(calc_simulation "$state")
 
   result=$(echo "$state" | jq \
     --argjson pph "$points_per_hour" \
+    --argjson sim "$simulation" \
     --arg ver "$version" \
-    '. + {pointsPerHour: $pph, version: $ver}')
+    '. + {pointsPerHour: $pph, simulation: $sim, version: $ver}')
   respond "200" "$result"
 fi

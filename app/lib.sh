@@ -111,6 +111,8 @@ init_state() {
     .settings.vaultMode //= "off" |
     .settings.wedgeMode //= "off" |
     .settings.minSpendGb //= 50 |
+    .settings.autoRefresh //= true |
+    .settings.autoRefreshMinutes //= 5 |
     .paused //= false |
     # Migrate old boolean vaultEnabled to vaultMode
     if .settings.vaultEnabled == true then .settings.vaultMode = "once" else . end |
@@ -677,6 +679,8 @@ run_spend() {
   local wedge_purchased="false"
   local upload_gb=0
   local total_points_spent=0
+  local buffer
+  buffer=$(echo "$state" | jq -r '.settings.pointsBuffer // 10000')
 
   # 3. Auto VIP
   local auto_vip
@@ -693,20 +697,24 @@ run_spend() {
       if [ "$days_remaining" -lt $((VIP_MAX_DAYS - 1)) ]; then
         local days_to_buy=$((VIP_MAX_DAYS - days_remaining))
         local est_cost=$(awk "BEGIN {printf \"%.0f\", $days_to_buy * $VIP_POINTS_PER_4WEEKS / 28}")
-        echo "[forager] VIP has ${days_remaining}d, buying ${days_to_buy}d (~${est_cost} pts)..." >&2
-        local vip_result
-        vip_result=$(buy_vip)
-        if [ -n "$vip_result" ]; then
-          local vip_success
-          vip_success=$(echo "$vip_result" | jq -r '.success // false')
-          if [ "$vip_success" = "true" ]; then
-            local verified_pts
-            verified_pts=$(verify_purchase "$current_points" "$vip_result" "VIP")
-            if [ -n "$verified_pts" ]; then
-              vip_purchased="true"
-              current_points="$verified_pts"
+        if [ $((current_points - est_cost)) -ge "$buffer" ]; then
+          echo "[forager] VIP has ${days_remaining}d, buying ${days_to_buy}d (~${est_cost} pts)..." >&2
+          local vip_result
+          vip_result=$(buy_vip)
+          if [ -n "$vip_result" ]; then
+            local vip_success
+            vip_success=$(echo "$vip_result" | jq -r '.success // false')
+            if [ "$vip_success" = "true" ]; then
+              local verified_pts
+              verified_pts=$(verify_purchase "$current_points" "$vip_result" "VIP")
+              if [ -n "$verified_pts" ]; then
+                vip_purchased="true"
+                current_points="$verified_pts"
+              fi
             fi
           fi
+        else
+          echo "[forager] VIP needs ~${est_cost} pts but would breach buffer (${current_points} - ${est_cost} < ${buffer}) — skipping" >&2
         fi
       fi
     fi
@@ -715,7 +723,7 @@ run_spend() {
   # 4. Wedge purchase (off / before upload / FL-only)
   local wedge_mode
   wedge_mode=$(echo "$state" | jq -r '.settings.wedgeMode // "off"')
-  if [ "$wedge_mode" != "off" ] && [ "$current_points" -ge "$WEDGE_COST" ]; then
+  if [ "$wedge_mode" != "off" ] && [ $((current_points - WEDGE_COST)) -ge "$buffer" ]; then
     echo "[forager] Buying wedge (${WEDGE_COST} points)..." >&2
     local wedge_result
     wedge_result=$(buy_wedge)
@@ -815,7 +823,8 @@ run_spend() {
         fi
 
         # Contribute if conditions met and we have enough points
-        if [ "$should_contribute" = "true" ] && [ "$current_points" -ge "$VAULT_COST" ]; then
+        local vault_affordable=$(( current_points - buffer ))
+        if [ "$should_contribute" = "true" ] && [ "$vault_affordable" -ge "$VAULT_COST" ]; then
           echo "[forager] Contributing to vault (${VAULT_COST} points)..." >&2
           local donate_html
           donate_html=$(donate_to_vault "$VAULT_COST")
@@ -842,8 +851,7 @@ run_spend() {
   fi
 
   # 6. Buy upload credit (skip if wedge mode is "only")
-  local buffer min_spend_gb
-  buffer=$(echo "$state" | jq -r '.settings.pointsBuffer // 10000')
+  local min_spend_gb
   min_spend_gb=$(echo "$state" | jq -r '.settings.minSpendGb // 50')
 
   if [ "$min_spend_gb" -eq 0 ]; then
@@ -892,24 +900,53 @@ run_spend() {
 
   local points_after="$current_points"
 
-  # Re-fetch profile to get updated balances (VIP expiry, points, upload)
-  if [ "$vip_purchased" = "true" ] || [ "$upload_gb" -gt 0 ]; then
-    echo "[forager] Re-fetching profile after purchases..." >&2
-    local updated_profile
-    updated_profile=$(fetch_profile)
-    if [ -n "$updated_profile" ]; then
-      local new_pts
-      new_pts=$(echo "$updated_profile" | jq -r '.bonusPoints // empty')
-      if [ -n "$new_pts" ]; then
-        points_after="$new_pts"
-        current_points="$new_pts"
+  # Always re-fetch profile after spend cycle for updated balance, ratio, upload
+  echo "[forager] Re-fetching profile after spend cycle..." >&2
+  local updated_profile
+  updated_profile=$(fetch_profile)
+  if [ -n "$updated_profile" ]; then
+    local new_pts
+    new_pts=$(echo "$updated_profile" | jq -r '.bonusPoints // empty')
+    if [ -n "$new_pts" ]; then
+      points_after="$new_pts"
+      current_points="$new_pts"
+    fi
+    acquire_lock
+    state=$(read_state)
+    state=$(echo "$state" | jq --argjson p "$updated_profile" '.profile = (.profile // {}) * $p')
+    echo "$state" | write_state
+    release_lock
+    echo "[forager] Profile updated: ${points_after} pts, ratio: $(echo "$updated_profile" | jq -r '.ratio // "?"'), VIP: $(echo "$updated_profile" | jq -r '.vipUntil // "unknown"')" >&2
+  fi
+
+  # Re-scrape vault page if vault was used, to get updated pot amount and contribution
+  if [ "$vault_entered" = "true" ] && [ "$has_browser_session" = "true" ]; then
+    echo "[forager] Re-scraping vault page for updated stats..." >&2
+    local vault_html
+    vault_html=$(fetch_vault_page)
+    if [ -n "$vault_html" ]; then
+      local vault_info
+      vault_info=$(parse_vault_page "$vault_html")
+      if [ -n "$vault_info" ]; then
+        local pot_amount pot_max user_total_donated start_date
+        pot_amount=$(echo "$vault_info" | jq -r '.potAmount')
+        pot_max=$(echo "$vault_info" | jq -r '.potMax')
+        user_total_donated=$(echo "$vault_info" | jq -r '.userTotalDonated')
+        start_date=$(echo "$vault_info" | jq -r '.startDate // empty')
+        acquire_lock
+        state=$(read_state)
+        state=$(echo "$state" | jq \
+          --argjson amt "${pot_amount:-0}" \
+          --argjson max "${pot_max:-20000000}" \
+          --argjson contrib "${user_total_donated:-0}" \
+          '.vault.currentPotAmount = $amt | .vault.potMax = $max | .vault.currentPotContributed = $contrib')
+        if [ -n "$start_date" ]; then
+          state=$(echo "$state" | jq --arg sd "$start_date" '.vault.potStartDate = $sd')
+        fi
+        echo "$state" | write_state
+        release_lock
+        echo "[forager] Vault updated: pot ${pot_amount}/${pot_max}, our contribution: ${user_total_donated}" >&2
       fi
-      acquire_lock
-      state=$(read_state)
-      state=$(echo "$state" | jq --argjson p "$updated_profile" '.profile = (.profile // {}) * $p')
-      echo "$state" | write_state
-      release_lock
-      echo "[forager] Profile updated: ${points_after} pts, VIP: $(echo "$updated_profile" | jq -r '.vipUntil // "unknown"')" >&2
     fi
   fi
 
@@ -1000,31 +1037,18 @@ run_spend() {
     }'
 }
 
-# --- Dry Run (simulate spend, no side effects) ---
+# --- Simulation (compute next spend from cached state, no API calls) ---
 
-run_dry_spend() {
-  # Ensure we have a valid session
-  ensure_session
-  if [ $? -ne 0 ]; then
-    echo '{"error":"No valid session"}' >&2
-    return 1
-  fi
-
-  # Fetch fresh profile from MAM
-  local profile
-  profile=$(fetch_profile)
-  if [ -z "$profile" ]; then
-    echo '{"error":"Failed to fetch profile"}' >&2
-    return 1
-  fi
+calc_simulation() {
+  local state="$1"
 
   local bonus_points
-  bonus_points=$(echo "$profile" | jq -r '.bonusPoints')
-
-  acquire_lock
-  local state
-  state=$(read_state)
-  release_lock
+  bonus_points=$(echo "$state" | jq -r '.profile.bonusPoints // empty')
+  if [ -z "$bonus_points" ] || [ "$bonus_points" = "null" ]; then
+    # No profile data yet — can't simulate
+    echo 'null'
+    return 0
+  fi
 
   local buffer auto_vip vault_mode
   buffer=$(echo "$state" | jq -r '.settings.pointsBuffer // 10000')
@@ -1039,7 +1063,7 @@ run_dry_spend() {
   # Check VIP
   if [ "$auto_vip" = "true" ]; then
     local vip_until
-    vip_until=$(echo "$profile" | jq -r '.vipUntil // empty')
+    vip_until=$(echo "$state" | jq -r '.profile.vipUntil // empty')
     if [ -n "$vip_until" ]; then
       local vip_epoch now_epoch days_remaining
       vip_epoch=$(date -d "$vip_until" +%s 2>/dev/null || echo 0)
@@ -1048,10 +1072,12 @@ run_dry_spend() {
       if [ "$days_remaining" -lt $((VIP_MAX_DAYS - 1)) ]; then
         local days_to_buy=$((VIP_MAX_DAYS - days_remaining))
         vip_cost=$(awk "BEGIN {printf \"%.0f\", $days_to_buy * $VIP_POINTS_PER_4WEEKS / 28}")
-        if [ "$vip_cost" -gt 0 ]; then
+        if [ "$vip_cost" -gt 0 ] && [ $((remaining - vip_cost)) -ge "$buffer" ]; then
           would_vip="true"
           vip_reason="VIP has ${days_remaining}d remaining — would buy ${days_to_buy}d for ~${vip_cost} pts"
           remaining=$((remaining - vip_cost))
+        elif [ "$vip_cost" -gt 0 ]; then
+          vip_reason="VIP needs ~${vip_cost} pts but would breach buffer (${remaining} - ${vip_cost} < ${buffer})"
         else
           vip_reason="VIP has ${days_remaining} days remaining (at cap)"
         fi
@@ -1072,13 +1098,13 @@ run_dry_spend() {
   local wedge_mode_val
   wedge_mode_val=$(echo "$state" | jq -r '.settings.wedgeMode // "off"')
   if [ "$wedge_mode_val" != "off" ]; then
-    if [ "$remaining" -ge "$WEDGE_COST" ]; then
+    if [ $((remaining - WEDGE_COST)) -ge "$buffer" ]; then
       would_wedge="true"
       wedge_reason="Would buy wedge (${WEDGE_COST} points, mode: ${wedge_mode_val})"
       wedge_cost_val=$WEDGE_COST
       remaining=$((remaining - WEDGE_COST))
     else
-      wedge_reason="Not enough points for wedge (need ${WEDGE_COST})"
+      wedge_reason="Wedge needs ${WEDGE_COST} pts but would breach buffer (${remaining} - ${WEDGE_COST} < ${buffer})"
     fi
   else
     wedge_reason="Wedge buying is disabled"
@@ -1107,7 +1133,6 @@ run_dry_spend() {
         should_vault="true"
       fi
     elif [ "$vault_mode" = "daily" ]; then
-      # Check donatedToday from last vault page scrape if available
       local last_vault_at
       last_vault_at=$(echo "$state" | jq -r '.vault.lastEntryAt // empty')
       if [ -z "$last_vault_at" ]; then
@@ -1122,13 +1147,14 @@ run_dry_spend() {
         fi
       fi
     fi
-    if [ "$should_vault" = "true" ] && [ "$remaining" -ge "$VAULT_COST" ]; then
+    local vault_affordable=$((remaining - buffer))
+    if [ "$should_vault" = "true" ] && [ "$vault_affordable" -ge "$VAULT_COST" ]; then
       would_vault="true"
       vault_reason="Would donate ${VAULT_COST} points (mode: ${vault_mode})"
       vault_cost_val=$VAULT_COST
       remaining=$((remaining - VAULT_COST))
     elif [ "$should_vault" = "true" ]; then
-      vault_reason="Not enough points for vault donation (need ${VAULT_COST})"
+      vault_reason="Not enough points above buffer for vault (need ${VAULT_COST}, have ${vault_affordable} above buffer)"
     fi
   else
     vault_reason="Vault is disabled"
@@ -1138,7 +1164,6 @@ run_dry_spend() {
   local upload_gb=0 upload_cost=0 upload_reason=""
   local min_spend_gb
   min_spend_gb=$(echo "$state" | jq -r '.settings.minSpendGb // 50')
-  # MAM enforces a minimum of 50 GB per API call
   local mam_min_gb=50
   if [ "$min_spend_gb" -lt "$mam_min_gb" ]; then
     min_spend_gb=$mam_min_gb
@@ -1178,7 +1203,6 @@ run_dry_spend() {
     --argjson totalCost "$total_cost" \
     --argjson pointsAfter "$points_after" \
     '{
-      dryRun: true,
       bonusPoints: $bonusPoints,
       buffer: $buffer,
       vip: {would: $wouldVip, reason: $vipReason},
@@ -1188,6 +1212,34 @@ run_dry_spend() {
       totalCost: $totalCost,
       pointsAfter: $pointsAfter
     }'
+}
+
+# Legacy wrapper — kept for /dry-spend endpoint backward compat
+run_dry_spend() {
+  ensure_session
+  if [ $? -ne 0 ]; then
+    echo '{"error":"No valid session"}' >&2
+    return 1
+  fi
+
+  local profile
+  profile=$(fetch_profile)
+  if [ -z "$profile" ]; then
+    echo '{"error":"Failed to fetch profile"}' >&2
+    return 1
+  fi
+
+  acquire_lock
+  local state
+  state=$(read_state)
+  state=$(echo "$state" | jq --argjson p "$profile" '.profile = (.profile // {}) * $p')
+  echo "$state" | write_state
+  release_lock
+
+  state=$(read_state)
+  local sim
+  sim=$(calc_simulation "$state")
+  echo "$sim" | jq '.dryRun = true'
 }
 
 # --- Refresh (stats only, no spending) ---
@@ -1225,6 +1277,50 @@ run_refresh() {
   is_expired=$(echo "$state" | jq -r '.browserSession.expired // false')
   if [ -n "$has_mbsc" ] && [ "$is_expired" != "true" ]; then
     refresh_profile_page 2>&1 >/dev/null
+
+    # Also refresh vault stats if vault mode is enabled
+    local vault_mode
+    vault_mode=$(echo "$state" | jq -r '.settings.vaultMode // "off"')
+    if [ "$vault_mode" != "off" ]; then
+      local vault_html
+      vault_html=$(fetch_vault_page)
+      if [ -n "$vault_html" ]; then
+        local vault_info
+        vault_info=$(parse_vault_page "$vault_html")
+        if [ -n "$vault_info" ]; then
+          local pot_amount pot_max user_total start_date
+          pot_amount=$(echo "$vault_info" | jq -r '.potAmount')
+          pot_max=$(echo "$vault_info" | jq -r '.potMax')
+          user_total=$(echo "$vault_info" | jq -r '.userTotalDonated')
+          start_date=$(echo "$vault_info" | jq -r '.startDate // empty')
+          acquire_lock
+          state=$(read_state)
+          local pot_id="$start_date"
+          local current_pot_id
+          current_pot_id=$(echo "$state" | jq -r '.vault.currentPotId // empty')
+          if [ -n "$pot_id" ] && [ "$pot_id" != "$current_pot_id" ]; then
+            state=$(echo "$state" | jq --arg pid "$pot_id" '
+              .vault.currentPotId = $pid |
+              .vault.enteredCurrentPot = false |
+              .vault.currentPotContributed = 0
+            ')
+          fi
+          state=$(echo "$state" | jq \
+            --argjson amt "${pot_amount:-0}" \
+            --argjson max "${pot_max:-20000000}" \
+            --argjson contrib "${user_total:-0}" \
+            '.vault.currentPotAmount = $amt | .vault.potMax = $max | .vault.currentPotContributed = $contrib')
+          if [ -n "$start_date" ]; then
+            state=$(echo "$state" | jq --arg sd "$start_date" '.vault.potStartDate = $sd')
+          fi
+          if [ "$user_total" != "0" ] && [ -n "$user_total" ]; then
+            state=$(echo "$state" | jq '.vault.enteredCurrentPot = true')
+          fi
+          echo "$state" | write_state
+          release_lock
+        fi
+      fi
+    fi
   fi
 
   # Return profile with points/hour from state
