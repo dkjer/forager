@@ -1,8 +1,12 @@
-# Forager
+# <img src="www/forager.svg" width="32" height="32" alt=""> Forager
 
 Automatic bonus point spender for [MyAnonamouse](https://www.myanonamouse.net). Runs as a lightweight Docker container (~15 MB) with a web dashboard for configuration and monitoring.
 
 Forager converts idle bonus points into upload credit on a schedule, keeping your ratio healthy without manual intervention. It can also maintain VIP membership, buy Freeleech Wedges, and contribute to the Millionaire's Vault.
+
+<p align="center">
+  <img src="images/screenshot.png" alt="Forager dashboard" width="520">
+</p>
 
 ## Features
 
@@ -10,11 +14,12 @@ Forager converts idle bonus points into upload credit on a schedule, keeping you
 - **VIP Top-Off** — Automatically extend VIP to the 90-day cap when it drops below threshold
 - **Freeleech Wedges** — Buy wedges at 50,000 pts each (before upload, or wedge-only mode)
 - **Millionaire's Vault** — Donate 2,000 pts per pot (once per pot or daily)
-- **Dry Run** — Preview what a spend cycle would do without committing
+- **Spend Preview** — Next Spend card shows a live simulation based on current stats and settings
 - **Spend History** — Rolling 90-day log of all purchases
 - **Points/Hour** — Live stats scraped from your profile page
 - **Pause/Resume** — Temporarily halt scheduled spending
-- **Dark UI** — Single-page dashboard, auto-refreshes every 30 seconds
+- **Auto-Refresh** — Configurable refresh interval (default 5 min) fetches live stats from MAM
+- **Dark UI** — Single-page dashboard with collapsible cards
 
 ## Quick Start
 
@@ -128,7 +133,7 @@ All endpoints return JSON with CORS headers.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/health` | `{"ok": true, "version": "0.1.0"}` |
+| `GET` | `/health` | `{"ok": true, "version": "0.1.1"}` |
 | `GET` | `/state` | Full state with profile, settings, vault, history |
 | `PUT` | `/state` | Update cookie, settings, browser session, or pause state |
 | `POST` | `/refresh` | Fetch fresh stats from MAM (no spending) |

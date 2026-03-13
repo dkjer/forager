@@ -32,6 +32,17 @@ body {
 }
 #app { width: 100%; max-width: 520px; }
 
+/* Desktop two-column layout */
+@media (min-width: 960px) {
+  #app { max-width: 1080px; }
+  .two-col { display: flex; gap: 16px; align-items: flex-start; }
+  .col-left { flex: 1; min-width: 0; }
+  .col-right { flex: 1; min-width: 0; }
+}
+@media (max-width: 959px) {
+  .two-col { display: block; }
+}
+
 .card {
   background: var(--surface);
   border: 1px solid var(--border);
@@ -855,15 +866,22 @@ function render() {
     </div>
     ` : ''}
 
-    ${renderStats()}
-    ${renderVault()}
-    ${renderNextSpend()}
-    ${renderLastSpend()}
-    ${renderHistoryCard()}
-    ${renderSettings()}
+    <div class="two-col">
+      <div class="col-left">
+        ${renderStats()}
+        ${renderVault()}
+        ${renderSettings()}
+      </div>
+      <div class="col-right">
+        ${renderNextSpend()}
+        ${renderLastSpend()}
+        ${renderHistoryCard()}
+      </div>
+    </div>
 
     <div class="status-msg">
       Polling every 30s${(state.settings || {}).autoRefresh !== false ? ' &middot; auto-refresh every ' + ((state.settings || {}).autoRefreshMinutes || 5) + 'min' : ''}
+      &middot; <a href="https://github.com/dkjer/forager" target="_blank" rel="noopener" style="color:var(--dim);text-decoration:none">GitHub</a>
     </div>
   `;
 }
