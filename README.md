@@ -5,7 +5,7 @@ Automatic bonus point spender for [MyAnonamouse](https://www.myanonamouse.net). 
 Forager converts idle bonus points into upload credit on a schedule, keeping your ratio healthy without manual intervention. It can also maintain VIP membership, buy Freeleech Wedges, and contribute to the Millionaire's Vault.
 
 <p align="center">
-  <img src="images/screenshot.png" alt="Forager dashboard" width="520">
+  <img src="images/screenshot.png" alt="Forager dashboard">
 </p>
 
 ## Features
