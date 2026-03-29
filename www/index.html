@@ -160,6 +160,7 @@ button.primary:hover { background: #1e4a5e; }
   justify-content: space-between;
   align-items: center;
   padding: 8px 0;
+  gap: 8px;
 }
 .setting-row label { color: var(--dim); font-size: 12px; }
 input[type="number"] {
@@ -267,6 +268,31 @@ input[type="number"]:focus { outline: none; border-color: var(--accent); }
 }
 .paused-banner button:hover { background: #3a2a2a; }
 
+.session-banner {
+  background: #2a1a1a;
+  border: 1px solid var(--red);
+  border-radius: 8px;
+  padding: 16px 20px;
+  margin-bottom: 16px;
+}
+.session-banner .session-label {
+  color: var(--red);
+  font-size: 14px;
+  font-weight: bold;
+  text-transform: uppercase;
+  letter-spacing: 2px;
+}
+.session-banner .session-sub {
+  color: var(--dim);
+  font-size: 11px;
+  margin-top: 4px;
+}
+.session-banner .session-action {
+  color: var(--red);
+  font-size: 12px;
+  margin-top: 8px;
+}
+
 .sim-reason { color: var(--dim); font-size: 11px; font-style: italic; }
 </style>
 </head>
@@ -323,12 +349,16 @@ async function saveSetting(key, value) {
   render();
 }
 
+async function testNotify() {
+  await api('/notify-test', {method: 'POST'});
+}
+
 async function setCookie(val) {
   if (!val) return;
   state = await api('/state', {
     method: 'PUT',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({currentCookie: val})
+    body: JSON.stringify({currentCookie: val, sessionStatus: {valid: true, lastCheck: null, error: null}})
   });
   cookieVisible = false;
   render();
@@ -389,12 +419,17 @@ async function togglePause() {
 }
 
 function hasBrowserSession(st) {
-  const bs = st.browserSession || {};
-  return !!(bs.mbsc && bs.userAgent);
+  const s = st.settings || {};
+  return !!(s.mamEmail && s.mamPassword);
 }
 
 function isBrowserSessionExpired(st) {
   return !!(st.browserSession && st.browserSession.expired);
+}
+
+function isSessionInvalid(st) {
+  const ss = st.sessionStatus;
+  return ss && ss.valid === false;
 }
 
 function fmt(n) {
@@ -498,7 +533,7 @@ function renderStats() {
     summary = fmt(p.bonusPoints) + ' pts';
     if (pphVal) summary += ' &middot; ' + pph + '/hr';
   } else {
-    summary = '<span style="color:var(--red)">no cookie</span>';
+    summary = '<span style="color:var(--red)">no mam_id</span>';
   }
 
   let body = '';
@@ -516,7 +551,7 @@ function renderStats() {
       <div class="row"><span class="label">Last Refreshed</span><span class="value">${timeAgo(p.fetchedAt)}</span></div>
     `;
   } else {
-    body = '<div class="empty">Set your cookie below to get started</div>';
+    body = '<div class="empty">Set your mam_id session key below to get started</div>';
   }
   body += `
     <div class="btn-row">
@@ -557,13 +592,13 @@ function renderVault() {
 
   let body = '';
   if (!hasBrowserSession(state)) {
-    body = '<div class="empty">Set browser session cookie (mbsc) and User-Agent in settings to enable vault access</div>';
+    body = '<div class="empty">Set MAM Login credentials in settings to enable vault access</div>';
   } else if (isBrowserSessionExpired(state)) {
     const bs = state.browserSession || {};
     body = `
       <div style="color:var(--red);font-size:12px;text-align:center;padding:8px 0">
         Browser session has expired${bs.expiredAt ? ' (' + timeAgo(bs.expiredAt) + ')' : ''}.<br>
-        Paste a fresh mbsc cookie from your browser in settings below.
+        Check MAM Login credentials in settings.
       </div>`;
   } else {
     const contributed = v.currentPotContributed || 0;
@@ -728,12 +763,14 @@ function renderSettings() {
 
   let statusParts = [];
   if (!hasCookie) {
-    statusParts.push('<span style="color:var(--red)">no cookie</span>');
+    statusParts.push('<span style="color:var(--red)">no mam_id</span>');
+  } else if (isSessionInvalid(state)) {
+    statusParts.push('<span style="color:var(--red)">mam_id invalid</span>');
   }
   if (isBrowserSessionExpired(state)) {
-    statusParts.push('<span style="color:var(--red)">mbsc expired</span>');
+    statusParts.push('<span style="color:var(--red)">browser session expired</span>');
   } else if (!hasBrowserSession(state) && s.vaultMode && s.vaultMode !== 'off') {
-    statusParts.push('<span style="color:var(--yellow)">no mbsc</span>');
+    statusParts.push('<span style="color:var(--yellow)">no MAM login</span>');
   }
   if (isPaused) {
     statusParts.push('<span style="color:var(--red)">paused</span>');
@@ -787,7 +824,48 @@ function renderSettings() {
         <option value="daily" ${s.vaultMode==='daily'?'selected':''}>Daily</option>
       </select>
     </div>
-    ${!hasBrowserSession(state) ? '<div style="color:var(--dim);font-size:11px;font-style:italic;padding:0 0 8px">Set browser session below to enable vault</div>' : ''}
+    ${!hasBrowserSession(state) ? '<div style="color:var(--dim);font-size:11px;font-style:italic;padding:0 0 8px">Set MAM Login credentials below to enable vault</div>' : ''}
+    <div class="divider"></div>
+    <div class="cookie-row">
+      <span class="cookie-dot ${hasCookie ? (isSessionInvalid(state) ? 'unset' : 'set') : 'unset'}"></span>
+      <span style="color:var(--dim);font-size:12px">Session ID ${hasCookie ? (isSessionInvalid(state) ? '&bull; Invalid' : '&bull; Set') : '&bull; Not Set'}</span>
+      <span title="Log in to myanonamouse.net → go to Security Settings (username menu → Security) → scroll to 'Create Session' → generate a new mam_id session key and paste it here." style="cursor:help;color:var(--dim);font-size:12px;margin-left:4px">&#9432;</span>
+      <button style="flex:0;padding:6px 12px;font-size:11px" onclick="toggleCookie()">
+        ${cookieVisible ? 'Cancel' : 'Set mam_id'}
+      </button>
+    </div>
+    ${hasCookie && isSessionInvalid(state) ? '<div style="color:var(--red);font-size:11px;padding:0 0 8px">' + ((state.sessionStatus || {}).error || 'Session failed — paste a fresh mam_id session key') + '</div>' : ''}
+    <input type="text" class="cookie-input ${cookieVisible ? 'visible' : ''}" id="cookieInput"
+      placeholder="Paste mam_id session key..."
+      onkeydown="if(event.key==='Enter')setCookie(this.value)">
+    <div class="divider"></div>
+    <div style="color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:1px;padding:8px 0 4px">MAM Login (for Vault)</div>
+    <div class="setting-row">
+      <label>Email</label>
+      <input type="email" value="${s.mamEmail || ''}"
+        placeholder="email@example.com"
+        onchange="saveSetting('mamEmail', this.value)"
+        style="flex:1;min-width:0">
+    </div>
+    <div class="setting-row">
+      <label>Password</label>
+      <input type="password" value="${s.mamPassword || ''}"
+        placeholder="MAM password"
+        onchange="saveSetting('mamPassword', this.value)"
+        style="flex:1;min-width:0">
+    </div>
+    <div class="divider"></div>
+    <div style="color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:1px;padding:8px 0 4px">Notifications</div>
+    <div class="setting-row">
+      <label>ntfy URL</label>
+      <input type="text" value="${s.notifyUrl || ''}"
+        placeholder="http://ntfy:80/forager"
+        onchange="saveSetting('notifyUrl', this.value)"
+        style="flex:1;min-width:0">
+    </div>
+    <div class="setting-row">
+      <button style="flex:0;padding:6px 16px;font-size:11px" onclick="testNotify()">Send Test Notification</button>
+    </div>
     <div class="divider"></div>
     <div class="setting-row">
       <label>Auto-Refresh</label>
@@ -803,40 +881,6 @@ function renderSettings() {
         onchange="saveSetting('autoRefreshMinutes', parseInt(this.value))"
         style="width:60px">
     </div>
-    <div class="divider"></div>
-    <div class="cookie-row">
-      <span class="cookie-dot ${hasCookie ? 'set' : 'unset'}"></span>
-      <span style="color:var(--dim);font-size:12px">Cookie ${hasCookie ? '&bull; Set' : '&bull; Not Set'}</span>
-      <button style="flex:0;padding:6px 12px;font-size:11px" onclick="toggleCookie()">
-        ${cookieVisible ? 'Cancel' : 'Set Cookie'}
-      </button>
-    </div>
-    <input type="text" class="cookie-input ${cookieVisible ? 'visible' : ''}" id="cookieInput"
-      placeholder="Paste mam_id cookie value..."
-      onkeydown="if(event.key==='Enter')setCookie(this.value)">
-    <div class="divider"></div>
-    <div style="color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:1px;padding:8px 0 4px">Browser Session (for Vault)</div>
-    ${isBrowserSessionExpired(state) ? '<div style="color:var(--red);font-size:11px;padding:0 0 8px">Session expired — paste a fresh mbsc cookie from your browser</div>' : ''}
-    <div class="cookie-row">
-      <span class="cookie-dot ${(state.browserSession||{}).mbsc ? (isBrowserSessionExpired(state) ? 'unset' : 'set') : 'unset'}"></span>
-      <span style="color:var(--dim);font-size:12px">mbsc ${(state.browserSession||{}).mbsc ? (isBrowserSessionExpired(state) ? '&bull; Expired' : '&bull; Set') : '&bull; Not Set'}</span>
-      <button style="flex:0;padding:6px 12px;font-size:11px" onclick="mbscVisible=!mbscVisible;render();if(mbscVisible){var i=document.getElementById('mbscInput');if(i)i.focus()}">
-        ${mbscVisible ? 'Cancel' : 'Set'}
-      </button>
-    </div>
-    <input type="text" class="cookie-input ${mbscVisible ? 'visible' : ''}" id="mbscInput"
-      placeholder="Paste mbsc cookie value from browser..."
-      onkeydown="if(event.key==='Enter')setBrowserSession('mbsc',this.value)">
-    <div class="cookie-row">
-      <span class="cookie-dot ${(state.browserSession||{}).userAgent ? 'set' : 'unset'}"></span>
-      <span style="color:var(--dim);font-size:12px">User-Agent ${(state.browserSession||{}).userAgent ? '&bull; Set' : '&bull; Not Set'}</span>
-      <button style="flex:0;padding:6px 12px;font-size:11px" onclick="uaVisible=!uaVisible;render();if(uaVisible){var i=document.getElementById('uaInput');if(i)i.focus()}">
-        ${uaVisible ? 'Cancel' : 'Set'}
-      </button>
-    </div>
-    <input type="text" class="cookie-input ${uaVisible ? 'visible' : ''}" id="uaInput"
-      placeholder="Paste your browser User-Agent string..."
-      onkeydown="if(event.key==='Enter')setBrowserSession('userAgent',this.value)">
     <div class="divider"></div>
     <div class="setting-row">
       <label>${isPaused ? 'Spending is paused' : 'Spending is active'}</label>
@@ -854,8 +898,17 @@ function renderSettings() {
 
 function render() {
   const isPaused = !!state.paused;
+  const sessionBad = isSessionInvalid(state);
+  const ss = state.sessionStatus || {};
 
   $('app').innerHTML = `
+    ${sessionBad ? `
+    <div class="session-banner">
+      <div class="session-label">SESSION EXPIRED</div>
+      <div class="session-sub">The mam_id session key is no longer valid &mdash; Forager cannot connect to MAM.</div>
+      <div class="session-action">${ss.error || 'Paste a fresh mam_id session key in Settings below.'}${ss.lastCheck ? ' &middot; Last checked ' + timeAgo(ss.lastCheck) : ''}</div>
+    </div>
+    ` : ''}
     ${isPaused ? `
     <div class="paused-banner">
       <div>

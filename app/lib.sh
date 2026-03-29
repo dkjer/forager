@@ -18,6 +18,7 @@ WEDGE_COST=50000
 MAX_POINTS_HISTORY=48
 MAX_SPEND_HISTORY_DAYS=90
 VERIFY_DELAY=1  # seconds to wait before verifying purchase
+NOTIFY_URL="${NOTIFY_URL:-}"  # ntfy publish URL, e.g. http://ntfy/forager
 
 # --- Timestamps ---
 
@@ -29,10 +30,19 @@ timestamp() {
 }
 
 next_spend_timestamp() {
-  local interval_hours interval_secs next_ts tz
+  local interval_hours interval_secs base_epoch next_epoch next_ts tz
   interval_hours=$(read_state | jq -r '.settings.spendIntervalHours // 24')
   interval_secs=$((interval_hours * 3600))
-  next_ts=$(date -d "@$(($(date +%s) + interval_secs))" '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null)
+  # Base from lastSpend.at if available, otherwise now
+  local last_at
+  last_at=$(read_state | jq -r '.lastSpend.at // empty')
+  if [ -n "$last_at" ]; then
+    base_epoch=$(epoch_from_timestamp "$last_at")
+  else
+    base_epoch=$(date +%s)
+  fi
+  next_epoch=$((base_epoch + interval_secs))
+  next_ts=$(date -d "@${next_epoch}" '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null)
   tz="${TZ:-UTC}"
   printf '%s[%s]' "$next_ts" "$tz"
 }
@@ -127,48 +137,109 @@ init_state() {
     .spendHistory //= [] |
     .lifetime //= {totalGbPurchased: 0, totalPointsSpent: 0} |
     .pointsHistory //= [] |
-    .nextSpendAt //= null
+    .nextSpendAt //= null |
+    .sessionStatus //= {valid: true, lastCheck: null, error: null} |
+    .settings.notifyUrl //= null |
+    .settings.mamEmail //= null |
+    .settings.mamPassword //= null
   ' | write_state
+}
+
+# --- Notifications ---
+
+send_notification() {
+  local title="$1" message="$2" priority="${3:-default}" tags="${4:-}"
+  # Prefer state setting, fall back to env var
+  local url
+  url=$(read_state | jq -r '.settings.notifyUrl // empty')
+  [ -z "$url" ] && url="$NOTIFY_URL"
+  [ -z "$url" ] && return 0
+  curl -sf --max-time 10 \
+    -H "Title: $title" \
+    -H "Priority: $priority" \
+    ${tags:+-H "Tags: $tags"} \
+    -d "$message" \
+    "$url" >/dev/null 2>&1 || echo "[forager] Notification delivery failed" >&2
 }
 
 # --- MAM API ---
 
+MAM_HEADERS_FILE="/var/run/forager/mam_headers.$$"
+
+# Ensure headers directory exists
+mkdir -p /var/run/forager
+
+# Extract mam_id from Set-Cookie response header and save to state.json
+rotate_cookie() {
+  local headers_file="$1"
+  if [ ! -f "$headers_file" ]; then
+    return
+  fi
+  # MAM rotates mam_id on responses — update the cookie jar but NOT currentCookie.
+  # currentCookie is the original long-lived seed; the jar holds the active session.
+  rm -f "$headers_file"
+}
+
 # Ensure cookie jar has a valid session. Bootstrap from mam_id if needed.
+update_session_status() {
+  local valid="$1" error="$2"
+  local now
+  now=$(timestamp)
+  acquire_lock
+  local st
+  st=$(read_state)
+  echo "$st" | jq --argjson v "$valid" --arg e "$error" --arg t "$now" '
+    .sessionStatus = {valid: $v, lastCheck: $t, error: (if $e == "" then null else $e end)}
+  ' | write_state
+  release_lock
+}
+
 ensure_session() {
   local cookie
   cookie=$(get_cookie)
+  local hf="/var/run/forager/mam_headers_session.$$"
 
   # If jar exists and has content, test it
   if [ -f "$COOKIE_JAR" ] && [ -s "$COOKIE_JAR" ]; then
     local test_uid
     test_uid=$(curl -sf --max-time 15 \
+      -D "$hf" \
       -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
       -H "User-Agent: $USER_AGENT" \
       "${MAM_BASE}/jsonLoad.php?snatch_summary" 2>/dev/null | jq -r '.uid // empty')
     if [ -n "$test_uid" ]; then
+      rotate_cookie "$hf"
+      update_session_status "true" ""
       return 0  # Session valid
     fi
+    rm -f "$hf"
     echo "[forager] Cookie jar session expired, re-bootstrapping..." >&2
   fi
 
   # Bootstrap from mam_id
   if [ -z "$cookie" ]; then
     echo "[forager] No mam_id cookie set" >&2
+    update_session_status "false" "No mam_id cookie configured"
     return 1
   fi
 
   echo "[forager] Bootstrapping session from mam_id..." >&2
   local test_uid
   test_uid=$(curl -sf --max-time 15 \
+    -D "$hf" \
     -b "mam_id=$cookie" -c "$COOKIE_JAR" \
     -H "User-Agent: $USER_AGENT" \
     "${MAM_BASE}/jsonLoad.php?snatch_summary" 2>/dev/null | jq -r '.uid // empty')
   if [ -n "$test_uid" ]; then
+    rotate_cookie "$hf"
     echo "[forager] Session established for uid $test_uid" >&2
+    update_session_status "true" ""
     return 0
   fi
 
+  rm -f "$hf"
   echo "[forager] Failed to establish session" >&2
+  update_session_status "false" "Cookie rejected — paste a fresh mam_id cookie"
   return 1
 }
 
@@ -177,6 +248,7 @@ mam_request() {
   local url="${MAM_BASE}${path}"
   local ts
   ts=$(date +%s%3N)
+  local hf="/var/run/forager/mam_headers_req.$$"
 
   # Append cache-busting timestamp
   case "$url" in
@@ -187,6 +259,7 @@ mam_request() {
   local body
   if [ -n "$post_data" ]; then
     body=$(curl -sf --max-time 15 \
+      -D "$hf" \
       -X "$method" \
       -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
       -H "User-Agent: $USER_AGENT" \
@@ -194,6 +267,7 @@ mam_request() {
       "$url" 2>/dev/null)
   else
     body=$(curl -sf --max-time 15 \
+      -D "$hf" \
       -X "$method" \
       -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
       -H "User-Agent: $USER_AGENT" \
@@ -202,9 +276,11 @@ mam_request() {
 
   local exit_code=$?
   if [ $exit_code -ne 0 ]; then
+    rm -f "$hf"
     return 1
   fi
 
+  rotate_cookie "$hf"
   printf '%s' "$body"
 }
 
@@ -212,11 +288,23 @@ mam_request() {
 mam_request_init() {
   local cookie="$1" path="$2"
   local url="${MAM_BASE}${path}"
+  local hf="/var/run/forager/mam_headers_init.$$"
 
-  curl -sf --max-time 15 \
+  local body
+  body=$(curl -sf --max-time 15 \
+    -D "$hf" \
     -b "mam_id=$cookie" -c "$COOKIE_JAR" \
     -H "User-Agent: $USER_AGENT" \
-    "$url" 2>/dev/null
+    "$url" 2>/dev/null)
+
+  local exit_code=$?
+  if [ $exit_code -ne 0 ]; then
+    rm -f "$hf"
+    return 1
+  fi
+
+  rotate_cookie "$hf"
+  printf '%s' "$body"
 }
 
 # --- Browser Session (mbsc) for HTML pages ---
@@ -239,92 +327,117 @@ load_browser_session() {
   return 0
 }
 
-# Make an HTML page request using the browser session (mbsc cookie + UA)
-# Updates the mbsc cookie in state from the response Set-Cookie
+# Make an HTML page request using headless Chromium sidecar.
+# The browser service handles login, cookies, and TLS fingerprinting.
 # Returns 1 on failure, 2 if session is expired/invalid
+BROWSER_URL="${BROWSER_URL:-http://forager-browser:5012}"
+
 mam_html_request() {
   local path="$1"
-  local post_data="$2"  # Optional: if set, sends POST with this data
-  local url="${MAM_BASE}${path}"
+  local post_data="$2"  # Currently unused with browser approach
 
-  if [ -z "$BROWSER_UA" ]; then
-    load_browser_session || return 1
-  fi
-
-  local out_jar="${MBSC_FILE}.new"
-  local http_code body
-  # Don't use -f or -L — we need to detect 302 redirects to login
-  if [ -n "$post_data" ]; then
-    body=$(curl -s --max-time 15 \
-      -b "$MBSC_FILE" \
-      -c "$out_jar" \
-      -w '\n%{http_code}' \
-      -H "User-Agent: $BROWSER_UA" \
-      -d "$post_data" \
-      "$url" 2>/dev/null)
-  else
-    body=$(curl -s --max-time 15 \
-      -b "$MBSC_FILE" \
-      -c "$out_jar" \
-      -w '\n%{http_code}' \
-      -H "User-Agent: $BROWSER_UA" \
-      "$url" 2>/dev/null)
-  fi
-
-  # Extract HTTP code from last line
-  http_code=$(echo "$body" | tail -1)
-  body=$(echo "$body" | sed '$d')
-
-  # Detect session expiry: 302 redirect to login, or deleted mbsc cookie
-  if [ "$http_code" = "302" ] || [ "$http_code" = "403" ]; then
-    echo "[forager] Browser session expired (HTTP $http_code on $path)" >&2
-    mark_browser_session_expired
-    rm -f "$out_jar"
+  # Ensure browser is logged in
+  if ! browser_ensure_login; then
     return 2
   fi
 
-  if [ "$http_code" != "200" ]; then
-    echo "[forager] HTML request failed: $path (HTTP $http_code)" >&2
-    rm -f "$out_jar"
+  local result json_payload
+  if [ -n "$post_data" ]; then
+    json_payload=$(jq -n --arg p "$path" --arg pd "$post_data" '{path: $p, postData: $pd}')
+  else
+    json_payload=$(jq -n --arg p "$path" '{path: $p}')
+  fi
+  result=$(curl -sf --max-time 45 \
+    -H "Content-Type: application/json" \
+    -d "$json_payload" \
+    "${BROWSER_URL}/fetch" 2>/dev/null)
+
+  if [ -z "$result" ]; then
+    echo "[forager] Browser fetch failed: $path (no response from browser service)" >&2
     return 1
   fi
 
-  # Check if the response contains a login redirect (sometimes 200 with JS redirect)
-  if echo "$body" | grep -q 'login.php?returnto='; then
-    echo "[forager] Browser session expired (login redirect in body for $path)" >&2
+  local status body error
+  status=$(echo "$result" | jq -r '.status')
+  body=$(echo "$result" | jq -r '.body // empty')
+  error=$(echo "$result" | jq -r '.error // empty')
+
+  if [ -n "$error" ] && [ "$error" != "null" ]; then
+    echo "[forager] Browser fetch error: $error" >&2
+    if echo "$error" | grep -qi "expired\|login"; then
+      mark_browser_session_expired
+      return 2
+    fi
+    return 1
+  fi
+
+  if [ "$status" = "302" ] || [ "$status" = "0" ]; then
+    echo "[forager] Browser session expired (status $status on $path)" >&2
     mark_browser_session_expired
-    rm -f "$out_jar"
     return 2
   fi
 
-  # Capture rotated mbsc from response cookie jar
-  local new_mbsc
-  new_mbsc=$(grep 'mbsc' "$out_jar" 2>/dev/null | awk '{print $NF}')
-  if [ -n "$new_mbsc" ]; then
-    # Check for "mbsc=deleted" which means session was killed
-    if [ "$new_mbsc" = "deleted" ]; then
-      echo "[forager] Browser session invalidated (mbsc deleted by server)" >&2
-      mark_browser_session_expired
-      rm -f "$out_jar"
-      return 2
-    fi
-    # Update state with new mbsc and clear any expired flag
-    acquire_lock
-    local state
-    state=$(read_state)
-    echo "$state" | jq --arg m "$new_mbsc" '
-      .browserSession.mbsc = $m |
-      .browserSession.expired = false
-    ' | write_state
-    release_lock
-    # Update mbsc file for next request
-    mv -f "$out_jar" "$MBSC_FILE"
-  else
-    rm -f "$out_jar"
-    echo "[forager] Warning: no mbsc cookie in response for $path" >&2
+  if [ "$status" != "200" ]; then
+    echo "[forager] Browser fetch failed: $path (HTTP $status)" >&2
+    return 1
+  fi
+
+  # Check for login redirect in body
+  if echo "$body" | grep -q 'login.php?returnto='; then
+    echo "[forager] Browser session expired (login redirect in body for $path)" >&2
+    mark_browser_session_expired
+    return 2
   fi
 
   printf '%s' "$body"
+}
+
+# Ensure the browser service is logged in to MAM
+browser_ensure_login() {
+  # Check if browser service is healthy and logged in
+  local health
+  health=$(curl -sf --max-time 5 "${BROWSER_URL}/health" 2>/dev/null)
+  if [ -z "$health" ]; then
+    echo "[forager] Browser service not reachable" >&2
+    return 1
+  fi
+
+  local is_logged_in
+  is_logged_in=$(echo "$health" | jq -r '.logged_in')
+  if [ "$is_logged_in" = "true" ]; then
+    return 0
+  fi
+
+  # Need to log in — read credentials from state
+  local email password
+  email=$(read_state | jq -r '.settings.mamEmail // empty')
+  password=$(read_state | jq -r '.settings.mamPassword // empty')
+  if [ -z "$email" ] || [ -z "$password" ]; then
+    echo "[forager] MAM credentials not configured — skipping vault (Settings → MAM Login)" >&2
+    return 1  # No notification — user may not care about vault
+  fi
+
+  echo "[forager] Logging in to MAM via browser..." >&2
+  local login_result
+  login_result=$(curl -sf --max-time 45 \
+    -H "Content-Type: application/json" \
+    -d "$(jq -n --arg e "$email" --arg p "$password" '{email: $e, password: $p}')" \
+    "${BROWSER_URL}/login" 2>/dev/null)
+
+  local ok login_error
+  ok=$(echo "$login_result" | jq -r '.ok')
+  login_error=$(echo "$login_result" | jq -r '.error // empty')
+
+  if [ "$ok" != "true" ]; then
+    echo "[forager] MAM login failed: ${login_error:-unknown}" >&2
+    send_notification "Forager: MAM Login Failed" \
+      "${login_error:-Login failed — check credentials in forager settings}" \
+      "high" "warning"
+    return 1
+  fi
+
+  echo "[forager] MAM login successful" >&2
+  return 0
 }
 
 # Mark browser session as expired in state so the UI can show a warning
@@ -339,7 +452,13 @@ mark_browser_session_expired() {
     .browserSession.expiredAt = $at
   ' | write_state
   release_lock
-  echo "[forager] Browser session marked as expired — user must provide a fresh mbsc cookie" >&2
+  echo "[forager] Browser session expired — will re-login on next vault access" >&2
+  # Only notify if credentials are configured (user cares about vault)
+  local email
+  email=$(read_state | jq -r '.settings.mamEmail // empty')
+  [ -n "$email" ] && send_notification "Forager: MAM Session Expired" \
+    "Browser session expired — will attempt re-login on next vault cycle" \
+    "default" "warning"
 }
 
 fetch_profile() {
@@ -567,13 +686,17 @@ donate_to_vault() {
     return $rc
   fi
 
-  # Verify donation succeeded by checking response content
-  if echo "$result_html" | grep -q 'have not donated today'; then
-    echo "[forager] Donation may have failed — page still says 'have not donated today'" >&2
+  # The POST response may show stale content (browser follows redirect).
+  # Re-fetch the vault page to verify the donation actually went through.
+  local verify_html
+  verify_html=$(mam_html_request "/millionaires/pot.php")
+  if echo "$verify_html" | grep -q 'have not donated today'; then
+    echo "[forager] Donation may have failed — vault page still says 'have not donated today'" >&2
     return 1
   fi
 
-  printf '%s' "$result_html"
+  echo "[forager] Vault donation verified — page confirms donated today" >&2
+  printf '%s' "$verify_html"
 }
 
 # --- Points History ---
@@ -694,8 +817,11 @@ run_spend() {
       now_epoch=$(date +%s)
       days_remaining=$(( (vip_epoch - now_epoch) / 86400 ))
       # Only top off when at least 1 full day below max VIP
-      if [ "$days_remaining" -lt $((VIP_MAX_DAYS - 1)) ]; then
+      # MAM API requires minimum 7-day purchase — only top off when at least 7 days below cap
+      if [ "$days_remaining" -lt $((VIP_MAX_DAYS - 7)) ]; then
         local days_to_buy=$((VIP_MAX_DAYS - days_remaining))
+        # Enforce minimum 7 days (MAM API rejects less)
+        [ "$days_to_buy" -lt 7 ] && days_to_buy=7
         local est_cost=$(awk "BEGIN {printf \"%.0f\", $days_to_buy * $VIP_POINTS_PER_4WEEKS / 28}")
         if [ $((current_points - est_cost)) -ge "$buffer" ]; then
           echo "[forager] VIP has ${days_remaining}d, buying ${days_to_buy}d (~${est_cost} pts)..." >&2
@@ -709,6 +835,7 @@ run_spend() {
               verified_pts=$(verify_purchase "$current_points" "$vip_result" "VIP")
               if [ -n "$verified_pts" ]; then
                 vip_purchased="true"
+                total_points_spent=$((total_points_spent + (current_points - verified_pts)))
                 current_points="$verified_pts"
               fi
             fi
@@ -865,6 +992,21 @@ run_spend() {
       min_spend_gb=$mam_min_gb
     fi
 
+    # Re-fetch actual balance before upload to avoid stale current_points
+    # (VIP/wedge/vault may have been charged server-side even if verify failed)
+    local fresh_profile
+    fresh_profile=$(fetch_profile)
+    if [ -n "$fresh_profile" ]; then
+      local fresh_pts
+      fresh_pts=$(echo "$fresh_profile" | jq -r '.bonusPoints')
+      if [ -n "$fresh_pts" ] && [ "$fresh_pts" -gt 0 ] 2>/dev/null; then
+        if [ "$fresh_pts" -ne "$current_points" ]; then
+          echo "[forager] Balance correction before upload: tracked ${current_points} -> actual ${fresh_pts}" >&2
+        fi
+        current_points="$fresh_pts"
+      fi
+    fi
+
     local spendable_pts=$((current_points - buffer))
     local min_spend_pts=$((min_spend_gb * POINTS_PER_GB))
     if [ "$spendable_pts" -lt "$min_spend_pts" ]; then
@@ -951,8 +1093,14 @@ run_spend() {
   fi
 
   # 7-9. Update state: lastSpend, spendHistory, lifetime, nextSpendAt
-  local next_at
-  next_at=$(next_spend_timestamp)
+  # Compute next spend from NOW (not the old lastSpend.at which may be stale)
+  local interval_hours interval_secs next_epoch next_at tz
+  interval_hours=$(read_state | jq -r '.settings.spendIntervalHours // 24')
+  interval_secs=$((interval_hours * 3600))
+  next_epoch=$(($(date +%s) + interval_secs))
+  next_at=$(date -d "@${next_epoch}" '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null)
+  tz="${TZ:-UTC}"
+  next_at="${next_at}[${tz}]"
 
   # Prune old spend history using shell date (jq strptime is unreliable with %z)
   local cutoff_epoch
@@ -1069,8 +1217,9 @@ calc_simulation() {
       vip_epoch=$(date -d "$vip_until" +%s 2>/dev/null || echo 0)
       now_epoch=$(date +%s)
       days_remaining=$(( (vip_epoch - now_epoch) / 86400 ))
-      if [ "$days_remaining" -lt $((VIP_MAX_DAYS - 1)) ]; then
+      if [ "$days_remaining" -lt $((VIP_MAX_DAYS - 7)) ]; then
         local days_to_buy=$((VIP_MAX_DAYS - days_remaining))
+        [ "$days_to_buy" -lt 7 ] && days_to_buy=7
         vip_cost=$(awk "BEGIN {printf \"%.0f\", $days_to_buy * $VIP_POINTS_PER_4WEEKS / 28}")
         if [ "$vip_cost" -gt 0 ] && [ $((remaining - vip_cost)) -ge "$buffer" ]; then
           would_vip="true"
@@ -1078,11 +1227,12 @@ calc_simulation() {
           remaining=$((remaining - vip_cost))
         elif [ "$vip_cost" -gt 0 ]; then
           vip_reason="VIP needs ~${vip_cost} pts but would breach buffer (${remaining} - ${vip_cost} < ${buffer})"
+          vip_cost=0
         else
           vip_reason="VIP has ${days_remaining} days remaining (at cap)"
         fi
       else
-        vip_reason="VIP has ${days_remaining} days remaining (within 1d of ${VIP_MAX_DAYS}d cap)"
+        vip_reason="VIP has ${days_remaining}d remaining (within 7d of ${VIP_MAX_DAYS}d cap — API requires min 7d purchase)"
       fi
     else
       vip_reason="No VIP expiry date found"

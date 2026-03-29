@@ -32,6 +32,14 @@ if [ "$REQUEST_METHOD" = "PUT" ]; then
     ')
   fi
 
+  # Merge sessionStatus if provided
+  new_session_status=$(echo "$body" | jq -r '.sessionStatus // empty')
+  if [ -n "$new_session_status" ] && [ "$new_session_status" != "" ]; then
+    state=$(echo "$state" | jq --argjson ss "$(echo "$body" | jq '.sessionStatus')" '
+      .sessionStatus = (.sessionStatus // {}) * $ss
+    ')
+  fi
+
   # Update paused if provided (can't use // empty since false is falsy in jq)
   has_paused=$(echo "$body" | jq 'has("paused")')
   if [ "$has_paused" = "true" ]; then
