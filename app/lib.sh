@@ -437,6 +437,12 @@ browser_ensure_login() {
   fi
 
   echo "[forager] MAM login successful" >&2
+  # Clear expired flag in state
+  acquire_lock
+  local st
+  st=$(read_state)
+  echo "$st" | jq '.browserSession.expired = false | .browserSession.expiredAt = null' | write_state
+  release_lock
   return 0
 }
 
@@ -877,7 +883,8 @@ run_spend() {
   local vault_mode
   vault_mode=$(echo "$state" | jq -r '.settings.vaultMode // "off"')
   local has_browser_session="false"
-  if [ -n "$(echo "$state" | jq -r '.browserSession.mbsc // empty')" ]; then
+  if [ -n "$(echo "$state" | jq -r '.settings.mamEmail // empty')" ] && \
+     [ -n "$(echo "$state" | jq -r '.settings.mamPassword // empty')" ]; then
     has_browser_session="true"
   fi
 
@@ -1264,10 +1271,13 @@ calc_simulation() {
   local would_vault="false"
   local vault_reason=""
   local vault_cost_val=0
-  local has_mbsc
-  has_mbsc=$(echo "$state" | jq -r '.browserSession.mbsc // empty')
-  if [ "$vault_mode" != "off" ] && [ -z "$has_mbsc" ]; then
-    vault_reason="Browser session (mbsc) not configured"
+  local has_mam_creds="false"
+  if [ -n "$(echo "$state" | jq -r '.settings.mamEmail // empty')" ] && \
+     [ -n "$(echo "$state" | jq -r '.settings.mamPassword // empty')" ]; then
+    has_mam_creds="true"
+  fi
+  if [ "$vault_mode" != "off" ] && [ "$has_mam_creds" = "false" ]; then
+    vault_reason="MAM Login credentials not configured"
   elif [ "$vault_mode" != "off" ]; then
     local should_vault="false"
     local entered
@@ -1420,12 +1430,13 @@ run_refresh() {
   echo "$state" | write_state
   release_lock
 
-  # Also scrape profile page for points/hour if browser session is available
-  local has_mbsc
-  has_mbsc=$(echo "$state" | jq -r '.browserSession.mbsc // empty')
-  local is_expired
-  is_expired=$(echo "$state" | jq -r '.browserSession.expired // false')
-  if [ -n "$has_mbsc" ] && [ "$is_expired" != "true" ]; then
+  # Also scrape profile page for points/hour if MAM login is configured
+  local has_mam_login="false"
+  if [ -n "$(echo "$state" | jq -r '.settings.mamEmail // empty')" ] && \
+     [ -n "$(echo "$state" | jq -r '.settings.mamPassword // empty')" ]; then
+    has_mam_login="true"
+  fi
+  if [ "$has_mam_login" = "true" ]; then
     refresh_profile_page 2>&1 >/dev/null
 
     # Also refresh vault stats if vault mode is enabled

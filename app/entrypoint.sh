@@ -51,7 +51,8 @@ url.rewrite-once = (
   "^/dry-spend\$" => "/cgi-bin/dry-spend.cgi",
   "^/refresh\$"   => "/cgi-bin/refresh.cgi",
   "^/health\$"  => "/cgi-bin/health.cgi",
-  "^/history\$" => "/cgi-bin/history.cgi"
+  "^/history\$" => "/cgi-bin/history.cgi",
+  "^/notify-test\$" => "/cgi-bin/notify-test.cgi"
 )
 
 mimetype.assign = (
