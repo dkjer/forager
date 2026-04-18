@@ -15,44 +15,35 @@ init_state
 # Clean up stale lock
 rm -rf "$LOCK_DIR"
 
-# Generate lighttpd.conf — auth modules must come before mod_cgi
+# Auth mode: session-based (HTML login) when FORAGER_USER/PASS set, none otherwise
 if [ -n "$FORAGER_USER" ] && [ -n "$FORAGER_PASS" ]; then
-  printf '%s:%s\n' "$FORAGER_USER" "$FORAGER_PASS" > /var/run/forager/htpasswd
-  AUTH_MODULES='"mod_auth", "mod_authn_file", '
-  AUTH_CONFIG='
-auth.backend = "plain"
-auth.backend.plain.userfile = "/var/run/forager/htpasswd"
-
-auth.require = ("/" => (
-  "method"  => "basic",
-  "realm"   => "forager",
-  "require" => "valid-user"
-))
-'
-  echo "[forager] Basic auth enabled (user: $FORAGER_USER)"
+  echo "[forager] Session auth enabled (user: $FORAGER_USER)"
 else
-  AUTH_MODULES=""
-  AUTH_CONFIG=""
   echo "[forager] No auth configured (set FORAGER_USER and FORAGER_PASS to enable)"
 fi
+
+# Save env vars for CGI scripts (lighttpd CGI runs in a clean environment)
+env | grep -E '^(FORAGER_|MAM_BASE|TZ|BROWSER_URL|NOTIFY_URL)=' | sed 's/^/export /' > /var/run/forager/env.sh
 
 LISTEN_PORT="${FORAGER_PORT:-5011}"
 
 cat > /var/run/forager/lighttpd.conf <<CONF
 server.document-root = "/www"
 server.port = ${LISTEN_PORT}
-server.modules = (${AUTH_MODULES}"mod_cgi", "mod_rewrite")
+server.modules = ("mod_cgi", "mod_rewrite")
 
 cgi.assign = (".cgi" => "")
 
 url.rewrite-once = (
-  "^/state\$"   => "/cgi-bin/state.cgi",
-  "^/spend\$"      => "/cgi-bin/spend.cgi",
-  "^/dry-spend\$" => "/cgi-bin/dry-spend.cgi",
-  "^/refresh\$"   => "/cgi-bin/refresh.cgi",
-  "^/health\$"  => "/cgi-bin/health.cgi",
-  "^/history\$" => "/cgi-bin/history.cgi",
-  "^/notify-test\$" => "/cgi-bin/notify-test.cgi"
+  "^/state\$"       => "/cgi-bin/state.cgi",
+  "^/spend\$"       => "/cgi-bin/spend.cgi",
+  "^/dry-spend\$"   => "/cgi-bin/dry-spend.cgi",
+  "^/refresh\$"     => "/cgi-bin/refresh.cgi",
+  "^/health\$"      => "/cgi-bin/health.cgi",
+  "^/history\$"     => "/cgi-bin/history.cgi",
+  "^/notify-test\$" => "/cgi-bin/notify-test.cgi",
+  "^/login\$"       => "/cgi-bin/login.cgi",
+  "^/logout\$"      => "/cgi-bin/logout.cgi"
 )
 
 mimetype.assign = (
@@ -65,7 +56,6 @@ mimetype.assign = (
 )
 
 index-file.names = ("index.html")
-${AUTH_CONFIG}
 CONF
 
 echo "[forager] Starting spender..."

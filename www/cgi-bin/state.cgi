@@ -1,6 +1,7 @@
 #!/bin/sh
 . /app/lib.sh
 handle_cors
+check_auth
 
 version="$FORAGER_VERSION"
 

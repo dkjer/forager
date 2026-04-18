@@ -1,6 +1,9 @@
 #!/bin/sh
 # Shared functions for forager — MAM bonus point auto-spender
 
+# Load env vars (CGI scripts run in a clean environment)
+[ -f /var/run/forager/env.sh ] && . /var/run/forager/env.sh
+
 FORAGER_VERSION=$(cat /app/VERSION 2>/dev/null | tr -d '\n' || echo "unknown")
 STATE_FILE="${FORAGER_STATE_DIR:-/srv/forager}/state.json"
 LOCK_DIR="/var/run/forager.lock"
@@ -1512,6 +1515,24 @@ respond() {
 handle_cors() {
   if [ "$REQUEST_METHOD" = "OPTIONS" ]; then
     respond "204"
+    exit 0
+  fi
+}
+
+# Session-based auth check. Call at the top of protected CGI scripts.
+# Passes through silently if auth is not configured (FORAGER_USER unset).
+check_auth() {
+  [ -z "${FORAGER_USER:-}" ] && return 0
+
+  # Extract forager_session cookie from HTTP_COOKIE
+  local session_cookie
+  session_cookie=$(echo "${HTTP_COOKIE:-}" | tr ';' '\n' | sed 's/^ //' | grep '^forager_session=' | head -1 | cut -d= -f2)
+
+  local expected_token
+  expected_token=$(cat /var/run/forager/session_token 2>/dev/null)
+
+  if [ -z "$session_cookie" ] || [ -z "$expected_token" ] || [ "$session_cookie" != "$expected_token" ]; then
+    respond "401" '{"error":"Unauthorized"}'
     exit 0
   fi
 }

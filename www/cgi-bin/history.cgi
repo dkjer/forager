@@ -1,6 +1,7 @@
 #!/bin/sh
 . /app/lib.sh
 handle_cors
+check_auth
 
 acquire_lock
 state=$(read_state)

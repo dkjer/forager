@@ -318,9 +318,87 @@ function toggleCollapse(id) {
   render();
 }
 
+let authRequired = false;
+
 async function api(path, opts = {}) {
   const res = await fetch(path, opts);
+  if (res.status === 401) {
+    authRequired = true;
+    render();
+    throw new Error('Unauthorized');
+  }
   return res.json();
+}
+
+async function checkAuth() {
+  try {
+    const res = await fetch('/login');
+    const data = await res.json();
+    authRequired = data.authRequired;
+    if (!authRequired) return true;
+    // Check if we have a valid session by trying to load state
+    const r = await fetch('/state');
+    if (r.status === 401) return false;
+    // Cache the state response so we don't fetch twice
+    state = await r.json();
+    return true;
+  } catch { return false; }
+}
+
+async function doLogin() {
+  const user = document.getElementById('loginUser').value;
+  const pass = document.getElementById('loginPass').value;
+  const err = document.getElementById('loginError');
+  err.textContent = '';
+  try {
+    const res = await fetch('/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username: user, password: pass})
+    });
+    const data = await res.json();
+    if (data.ok) {
+      authRequired = false;
+      await loadState();
+      startCountdown();
+      pollInterval = setInterval(loadState, 30000);
+      setupAutoRefresh();
+    } else {
+      err.textContent = data.error || 'Invalid credentials';
+    }
+  } catch (e) {
+    err.textContent = 'Login failed';
+  }
+}
+
+async function doLogout() {
+  await fetch('/logout', {method: 'POST'});
+  authRequired = true;
+  state = {};
+  render();
+}
+
+function renderLogin() {
+  return `
+    <div style="max-width:320px;margin:80px auto">
+      <h2 style="text-align:center;margin-bottom:24px;color:var(--accent)">Forager</h2>
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:24px">
+        <div style="margin-bottom:12px">
+          <label style="display:block;color:var(--dim);font-size:11px;margin-bottom:4px">Username</label>
+          <input type="text" id="loginUser" autocomplete="username"
+            style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--mono);font-size:13px"
+            onkeydown="if(event.key==='Enter')document.getElementById('loginPass').focus()">
+        </div>
+        <div style="margin-bottom:16px">
+          <label style="display:block;color:var(--dim);font-size:11px;margin-bottom:4px">Password</label>
+          <input type="password" id="loginPass" autocomplete="current-password"
+            style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--mono);font-size:13px"
+            onkeydown="if(event.key==='Enter')doLogin()">
+        </div>
+        <div id="loginError" style="color:var(--red);font-size:11px;margin-bottom:8px"></div>
+        <button onclick="doLogin()" class="primary" style="width:100%;padding:10px">Log In</button>
+      </div>
+    </div>`;
 }
 
 async function loadState() {
@@ -887,6 +965,12 @@ function renderSettings() {
       <button style="flex:0;padding:6px 16px;font-size:11px;${isPaused ? 'border-color:var(--green);color:var(--green)' : 'border-color:var(--red);color:var(--red)'}"
         onclick="togglePause()">${isPaused ? 'Resume' : 'Pause'}</button>
     </div>
+    ${authRequired !== undefined && document.cookie ? `
+    <div class="divider"></div>
+    <div class="setting-row">
+      <label style="color:var(--dim)">Logged in</label>
+      <button style="flex:0;padding:6px 16px;font-size:11px" onclick="doLogout()">Log Out</button>
+    </div>` : ''}
   `;
 
   return `
@@ -897,6 +981,12 @@ function renderSettings() {
 }
 
 function render() {
+  if (authRequired) {
+    $('app').innerHTML = renderLogin();
+    const u = document.getElementById('loginUser');
+    if (u) u.focus();
+    return;
+  }
   const isPaused = !!state.paused;
   const sessionBad = isSessionInvalid(state);
   const ss = state.sessionStatus || {};
@@ -976,10 +1066,15 @@ async function loadVersion() {
 
 async function init() {
   await loadVersion();
-  await loadState();
-  startCountdown();
-  pollInterval = setInterval(loadState, 30000);
-  setupAutoRefresh();
+  const loggedIn = await checkAuth();
+  if (loggedIn) {
+    await loadState();
+    startCountdown();
+    pollInterval = setInterval(loadState, 30000);
+    setupAutoRefresh();
+  } else {
+    render();
+  }
 }
 
 init();

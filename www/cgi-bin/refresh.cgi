@@ -1,6 +1,7 @@
 #!/bin/sh
 . /app/lib.sh
 handle_cors
+check_auth
 
 if [ "$REQUEST_METHOD" != "POST" ]; then
   respond "405" '{"error":"POST required"}'

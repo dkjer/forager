@@ -1,6 +1,7 @@
 #!/bin/sh
 . /app/lib.sh
 handle_cors
+check_auth
 if [ "$REQUEST_METHOD" = "POST" ]; then
   send_notification "Forager: Test" "Notifications are working!" "default" "bell"
   respond "200" '{"ok":true}'
