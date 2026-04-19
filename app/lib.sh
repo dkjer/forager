@@ -144,7 +144,8 @@ init_state() {
     .sessionStatus //= {valid: true, lastCheck: null, error: null} |
     .settings.notifyUrl //= null |
     .settings.mamEmail //= null |
-    .settings.mamPassword //= null
+    .settings.mamPassword //= null |
+    .settings.autoLogin //= true
   ' | write_state
 }
 
@@ -197,7 +198,10 @@ update_session_status() {
   release_lock
 }
 
+USE_BROWSER_API=""  # Set to "1" when using browser for API calls (no mam_id)
+
 ensure_session() {
+  USE_BROWSER_API=""
   local cookie
   cookie=$(get_cookie)
   local hf="/var/run/forager/mam_headers_session.$$"
@@ -241,13 +245,54 @@ ensure_session() {
   fi
 
   rm -f "$hf"
+  echo "[forager] mam_id rejected, attempting auto-login via browser..." >&2
+
+  # Try auto-login via browser, then use browser's session for the API call
+  if browser_ensure_login; then
+    local api_result
+    api_result=$(curl -sf --max-time 45 \
+      -H "Content-Type: application/json" \
+      -d '{"path":"/jsonLoad.php?snatch_summary"}' \
+      "${BROWSER_URL}/api-fetch" 2>/dev/null)
+
+    local api_uid
+    api_uid=$(echo "$api_result" | jq -r '.body' 2>/dev/null | jq -r '.uid // empty' 2>/dev/null)
+    if [ -n "$api_uid" ]; then
+      echo "[forager] Session established via browser auto-login for uid $api_uid" >&2
+      USE_BROWSER_API="1"
+      update_session_status "true" ""
+      return 0
+    fi
+    echo "[forager] Browser API fetch failed" >&2
+  fi
+
   echo "[forager] Failed to establish session" >&2
-  update_session_status "false" "Cookie rejected — paste a fresh mam_id cookie"
+  update_session_status "false" "Session failed — check MAM credentials in Settings"
   return 1
 }
 
 mam_request() {
   local path="$1" method="${2:-GET}" post_data="${3:-}"
+
+  # If using browser API mode (no mam_id), route through the browser service
+  if [ "$USE_BROWSER_API" = "1" ]; then
+    local api_result
+    api_result=$(curl -sf --max-time 45 \
+      -H "Content-Type: application/json" \
+      -d "$(jq -n --arg p "$path" '{path: $p}')" \
+      "${BROWSER_URL}/api-fetch" 2>/dev/null)
+    if [ -z "$api_result" ]; then
+      return 1
+    fi
+    local api_body
+    api_body=$(echo "$api_result" | jq -r '.body // empty')
+    if [ -z "$api_body" ]; then
+      return 1
+    fi
+    printf '%s' "$api_body"
+    return 0
+  fi
+
   local url="${MAM_BASE}${path}"
   local ts
   ts=$(date +%s%3N)

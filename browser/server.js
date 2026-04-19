@@ -25,12 +25,17 @@ async function doLogin(email, password) {
   await ensureBrowser();
   const page = await browserCtx.newPage();
   try {
-    await page.goto(`${MAM_BASE}/login.php`, { waitUntil: 'networkidle', timeout: 30000 });
+    await page.goto(`${MAM_BASE}/login.php`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    // Wait for the form to be visible (MAM uses JS to render parts of the page)
+    await page.waitForSelector('input[name="email"]', { state: 'visible', timeout: 15000 });
     await page.fill('input[name="email"]', email);
     await page.fill('input[name="password"]', password);
-    await page.check('input[name="rememberMe"]');
+    const rememberMe = await page.$('input[name="rememberMe"]');
+    if (rememberMe) await rememberMe.check();
     await page.click('input[type="submit"]');
-    await page.waitForLoadState('networkidle', { timeout: 30000 });
+    await page.waitForLoadState('domcontentloaded', { timeout: 30000 });
+    // Give the page a moment to settle after login redirect
+    await page.waitForTimeout(2000);
 
     const url = page.url();
     if (url.includes('login.php') || url.includes('takelogin.php')) {
@@ -42,7 +47,15 @@ async function doLogin(email, password) {
 
     loggedIn = true;
     console.error(`[browser] Logged in, redirected to ${url}`);
-    return { ok: true };
+
+    // Extract cookies (especially mam_id) from the browser context
+    const cookies = await browserCtx.cookies(MAM_BASE);
+    const cookieMap = {};
+    for (const c of cookies) {
+      cookieMap[c.name] = c.value;
+    }
+
+    return { ok: true, cookies: cookieMap };
   } catch (e) {
     return { ok: false, error: e.message };
   } finally {
@@ -89,6 +102,38 @@ async function doFetch(path, postData) {
   }
 }
 
+// Lightweight API fetch using the browser's cookies.
+// Navigates to MAM first so fetch() has the right origin and cookies.
+async function doApiFetch(path) {
+  if (!loggedIn) return { status: 0, error: 'Not logged in', body: '' };
+
+  await ensureBrowser();
+  const url = `${MAM_BASE}${path}`;
+  const page = await browserCtx.newPage();
+  try {
+    // Navigate to MAM base so we have the right origin for fetch()
+    await page.goto(`${MAM_BASE}/index.php`, { waitUntil: 'domcontentloaded', timeout: 15000 });
+
+    // Now fetch the API endpoint from within the MAM origin
+    const result = await page.evaluate(async (fetchUrl) => {
+      const resp = await fetch(fetchUrl, { credentials: 'include' });
+      const text = await resp.text();
+      return { status: resp.status, body: text, url: resp.url };
+    }, url);
+
+    if (result.url && result.url.includes('login.php')) {
+      loggedIn = false;
+      return { status: 302, body: '', error: 'Session expired' };
+    }
+
+    return result;
+  } catch (e) {
+    return { status: 0, body: '', error: e.message };
+  } finally {
+    await page.close();
+  }
+}
+
 function readBody(req) {
   return new Promise((resolve) => {
     let data = '';
@@ -108,6 +153,14 @@ const server = http.createServer(async (req, res) => {
     return respond(200, { ok: true, logged_in: loggedIn });
   }
 
+  if (req.method === 'GET' && req.url === '/cookies') {
+    if (!browserCtx || !loggedIn) return respond(200, { cookies: {} });
+    const cookies = await browserCtx.cookies(MAM_BASE);
+    const cookieMap = {};
+    for (const c of cookies) cookieMap[c.name] = c.value;
+    return respond(200, { cookies: cookieMap });
+  }
+
   if (req.method !== 'POST') return respond(404, { error: 'Not found' });
 
   const raw = await readBody(req);
@@ -121,6 +174,14 @@ const server = http.createServer(async (req, res) => {
     busy = true;
     try {
       const result = await doLogin(data.email, data.password);
+      respond(200, result);
+    } finally { busy = false; }
+  } else if (req.url === '/api-fetch') {
+    if (!data.path) return respond(400, { error: 'path required' });
+    if (busy) return respond(429, { error: 'Browser is busy' });
+    busy = true;
+    try {
+      const result = await doApiFetch(data.path);
       respond(200, result);
     } finally { busy = false; }
   } else if (req.url === '/fetch') {

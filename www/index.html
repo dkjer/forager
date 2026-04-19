@@ -839,16 +839,23 @@ function renderSettings() {
   const hasCookie = !!state.currentCookie;
   const isPaused = !!state.paused;
 
+  const autoLogin = s.autoLogin !== false && s.mamEmail && s.mamPassword;
   let statusParts = [];
-  if (!hasCookie) {
-    statusParts.push('<span style="color:var(--red)">no mam_id</span>');
-  } else if (isSessionInvalid(state)) {
-    statusParts.push('<span style="color:var(--red)">mam_id invalid</span>');
+  if (autoLogin) {
+    if (isSessionInvalid(state)) {
+      statusParts.push('<span style="color:var(--yellow)">auto-login pending</span>');
+    }
+  } else {
+    if (!hasCookie) {
+      statusParts.push('<span style="color:var(--red)">no mam_id</span>');
+    } else if (isSessionInvalid(state)) {
+      statusParts.push('<span style="color:var(--red)">mam_id invalid</span>');
+    }
   }
-  if (isBrowserSessionExpired(state)) {
+  if (!autoLogin && isBrowserSessionExpired(state)) {
     statusParts.push('<span style="color:var(--red)">browser session expired</span>');
-  } else if (!hasBrowserSession(state) && s.vaultMode && s.vaultMode !== 'off') {
-    statusParts.push('<span style="color:var(--yellow)">no MAM login</span>');
+  } else if (!autoLogin && !hasBrowserSession(state) && s.vaultMode && s.vaultMode !== 'off') {
+    statusParts.push('<span style="color:var(--yellow)">no MAM credentials</span>');
   }
   if (isPaused) {
     statusParts.push('<span style="color:var(--red)">paused</span>');
@@ -902,22 +909,9 @@ function renderSettings() {
         <option value="daily" ${s.vaultMode==='daily'?'selected':''}>Daily</option>
       </select>
     </div>
-    ${!hasBrowserSession(state) ? '<div style="color:var(--dim);font-size:11px;font-style:italic;padding:0 0 8px">Set MAM Login credentials below to enable vault</div>' : ''}
+    ${!hasBrowserSession(state) && !(s.mamEmail && s.mamPassword) ? '<div style="color:var(--dim);font-size:11px;font-style:italic;padding:0 0 8px">Set MAM Account credentials below to enable vault</div>' : ''}
     <div class="divider"></div>
-    <div class="cookie-row">
-      <span class="cookie-dot ${hasCookie ? (isSessionInvalid(state) ? 'unset' : 'set') : 'unset'}"></span>
-      <span style="color:var(--dim);font-size:12px">Session ID ${hasCookie ? (isSessionInvalid(state) ? '&bull; Invalid' : '&bull; Set') : '&bull; Not Set'}</span>
-      <span title="Log in to myanonamouse.net → go to Security Settings (username menu → Security) → scroll to 'Create Session' → generate a new mam_id session key and paste it here." style="cursor:help;color:var(--dim);font-size:12px;margin-left:4px">&#9432;</span>
-      <button style="flex:0;padding:6px 12px;font-size:11px" onclick="toggleCookie()">
-        ${cookieVisible ? 'Cancel' : 'Set mam_id'}
-      </button>
-    </div>
-    ${hasCookie && isSessionInvalid(state) ? '<div style="color:var(--red);font-size:11px;padding:0 0 8px">' + ((state.sessionStatus || {}).error || 'Session failed — paste a fresh mam_id session key') + '</div>' : ''}
-    <input type="text" class="cookie-input ${cookieVisible ? 'visible' : ''}" id="cookieInput"
-      placeholder="Paste mam_id session key..."
-      onkeydown="if(event.key==='Enter')setCookie(this.value)">
-    <div class="divider"></div>
-    <div style="color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:1px;padding:8px 0 4px">MAM Login (for Vault)</div>
+    <div style="color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:1px;padding:8px 0 4px">MAM Account</div>
     <div class="setting-row">
       <label>Email</label>
       <input type="email" value="${s.mamEmail || ''}"
@@ -932,6 +926,38 @@ function renderSettings() {
         onchange="saveSetting('mamPassword', this.value)"
         style="flex:1;min-width:0">
     </div>
+    <div class="setting-row">
+      <label>Auto-login</label>
+      <label class="toggle">
+        <input type="checkbox" ${s.autoLogin !== false ? 'checked' : ''}
+          onchange="saveSetting('autoLogin', this.checked)">
+        <span class="slider"></span>
+      </label>
+    </div>
+    ${s.autoLogin !== false && s.mamEmail && s.mamPassword ? `
+      <div style="color:var(--dim);font-size:11px;padding:0 0 4px">
+        Session: ${isSessionInvalid(state)
+          ? '<span style="color:var(--yellow)">will auto-login on next cycle</span>'
+          : '<span style="color:var(--green)">active</span>'}
+      </div>
+    ` : s.autoLogin !== false ? `
+      <div style="color:var(--red);font-size:11px;padding:0 0 4px">Enter email and password above to enable auto-login</div>
+    ` : ''}
+    ${s.autoLogin === false ? `
+    <div class="divider"></div>
+    <div class="cookie-row">
+      <span class="cookie-dot ${hasCookie ? (isSessionInvalid(state) ? 'unset' : 'set') : 'unset'}"></span>
+      <span style="color:var(--dim);font-size:12px">mam_id ${hasCookie ? (isSessionInvalid(state) ? '&bull; Invalid' : '&bull; Set') : '&bull; Not Set'}</span>
+      <span title="Log in to myanonamouse.net → go to Security Settings (username menu → Security) → scroll to Create Session → generate a new mam_id session key and paste it here." style="cursor:help;color:var(--dim);font-size:12px;margin-left:4px">&#9432;</span>
+      <button style="flex:0;padding:6px 12px;font-size:11px" onclick="toggleCookie()">
+        ${cookieVisible ? 'Cancel' : 'Set mam_id'}
+      </button>
+    </div>
+    ${hasCookie && isSessionInvalid(state) ? '<div style="color:var(--red);font-size:11px;padding:0 0 8px">' + ((state.sessionStatus || {}).error || 'Session failed — paste a fresh mam_id session key') + '</div>' : ''}
+    <input type="text" class="cookie-input ${cookieVisible ? 'visible' : ''}" id="cookieInput"
+      placeholder="Paste mam_id session key..."
+      onkeydown="if(event.key==='Enter')setCookie(this.value)">
+    ` : ''}
     <div class="divider"></div>
     <div style="color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:1px;padding:8px 0 4px">Notifications</div>
     <div class="setting-row">
@@ -991,12 +1017,15 @@ function render() {
   const sessionBad = isSessionInvalid(state);
   const ss = state.sessionStatus || {};
 
+  const sett = state.settings || {};
+  const hasAutoLogin = sett.autoLogin !== false && sett.mamEmail && sett.mamPassword;
+
   $('app').innerHTML = `
-    ${sessionBad ? `
+    ${sessionBad && !hasAutoLogin ? `
     <div class="session-banner">
       <div class="session-label">SESSION EXPIRED</div>
       <div class="session-sub">The mam_id session key is no longer valid &mdash; Forager cannot connect to MAM.</div>
-      <div class="session-action">${ss.error || 'Paste a fresh mam_id session key in Settings below.'}${ss.lastCheck ? ' &middot; Last checked ' + timeAgo(ss.lastCheck) : ''}</div>
+      <div class="session-action">${ss.error || 'Set MAM credentials and enable auto-login in Settings, or paste a fresh mam_id.'}${ss.lastCheck ? ' &middot; Last checked ' + timeAgo(ss.lastCheck) : ''}</div>
     </div>
     ` : ''}
     ${isPaused ? `
